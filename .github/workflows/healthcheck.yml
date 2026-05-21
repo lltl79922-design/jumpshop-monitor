@@ -1,0 +1,81 @@
+name: Daily Healthcheck
+
+on:
+  schedule:
+    # 北京时间 2:00 = UTC 18:00
+    - cron: '37 18 * * *'
+    # 北京时间 4:00 = UTC 20:00 (备用)
+    - cron: '37 20 * * *'
+    # 北京时间 6:00 = UTC 22:00 (备用)
+    - cron: '37 22 * * *'
+  workflow_dispatch:
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Setup config
+        run: cp config.example.json config.json
+
+      - name: Restore DB cache
+        uses: actions/cache/restore@v4
+        id: cache-db
+        with:
+          path: data/products.db
+          key: jumpshop-db-v2
+          restore-keys: |
+            jumpshop-db-v2
+
+      - name: Run Healthcheck
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python healthcheck.py
+
+      - name: Auto-Rebuild DB (if needed)
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          # 如果数据库坏了，强制重建
+          python -c "
+          import sqlite3, sys
+          from pathlib import Path
+          if Path('data/products.db').exists():
+              try:
+                  conn = sqlite3.connect('data/products.db')
+                  result = conn.execute('PRAGMA integrity_check').fetchone()
+                  conn.close()
+                  if result[0] == 'ok':
+                      print('DB OK')
+                      sys.exit(0)
+                  else:
+                      print(f'DB corrupt: {result[0]}')
+              except Exception as e:
+                  print(f'DB error: {e}')
+          else:
+              print('DB not found')
+          sys.exit(1)
+          " || python healthcheck.py --rebuild
+
+      - name: Save DB to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/products.db
+          key: jumpshop-db-v2

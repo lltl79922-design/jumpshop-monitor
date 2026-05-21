@@ -45,11 +45,37 @@ jobs:
         run: cp config.example.json config.json
 
       - name: Run monitor
+        id: monitor
+        continue-on-error: true
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
         run: python monitor_loop.py --once
+
+      - name: Self-heal on failure
+        if: steps.monitor.outcome == 'failure'
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          echo "Monitor failed, attempting self-heal..."
+          # 删除损坏的数据库
+          rm -f data/products.db data/products.db-wal data/products.db-shm
+          # 重建空数据库
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('data/products.db')
+          conn.execute('PRAGMA journal_mode=WAL')
+          conn.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, title TEXT, handle TEXT, vendor TEXT, tags TEXT, price INTEGER, available INTEGER, sku TEXT, image_url TEXT, url TEXT, published_at TEXT, updated_at TEXT, first_seen TEXT, last_checked TEXT, feishu_img_key TEXT DEFAULT \"\")')
+          conn.execute('CREATE TABLE IF NOT EXISTS change_log (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, change_type TEXT, old_value TEXT, new_value TEXT, detected_at TEXT, notified INTEGER DEFAULT 0)')
+          conn.commit()
+          conn.close()
+          "
+          # 重新运行监控(建立新基线)
+          python monitor_loop.py --once
+          echo "Self-heal complete"
 
       - name: Checkpoint DB (flush WAL to file)
         if: always()
