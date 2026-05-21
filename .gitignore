@@ -1,0 +1,8 @@
+# Jump Shop 监控 - 忽略文件
+data/products.db
+*.log
+data/monitor.log
+__pycache__/
+*.pyc
+test_*.py
+config.json

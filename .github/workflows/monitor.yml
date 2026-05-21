@@ -1,0 +1,48 @@
+name: Jump Shop Monitor
+
+on:
+  schedule:
+    # 每5分钟运行 (北京时间/东京时间)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Restore DB from cache
+        uses: actions/cache/restore@v4
+        id: cache-db
+        with:
+          path: data/products.db
+          key: jumpshop-db-${{ github.run_number }}
+          restore-keys: |
+            jumpshop-db-
+
+      - name: Setup config
+        run: cp config.example.json config.json
+
+      - name: Run monitor
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: python monitor_loop.py --once
+
+      - name: Save DB to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/products.db
+          key: jumpshop-db-${{ github.run_number }}

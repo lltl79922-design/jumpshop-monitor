@@ -1,0 +1,40 @@
+{
+    "shop_url": "https://jumpshop-benelic.com",
+    "poll_interval_seconds": 300,
+    "user_agents": [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+    ],
+    "notifications": {
+        "feishu": {
+            "enabled": true,
+            "webhook_url": "YOUR_FEISHU_WEBHOOK_URL",
+            "app_id": "YOUR_FEISHU_APP_ID",
+            "app_secret": "YOUR_FEISHU_APP_SECRET",
+            "image_preview": true,
+            "max_image_items": 10
+        },
+        "wechat_work": {
+            "enabled": false,
+            "webhook_url": "YOUR_WECHAT_WEBHOOK_URL"
+        },
+        "email": {
+            "enabled": false,
+            "smtp_host": "smtp.gmail.com",
+            "smtp_port": 587,
+            "smtp_user": "your-email@gmail.com",
+            "smtp_pass": "your-app-password",
+            "to_emails": ["your-email@example.com"]
+        }
+    },
+    "monitor_options": {
+        "detect_new_products": true,
+        "detect_restocks": true,
+        "detect_sold_out": true,
+        "detect_price_changes": true,
+        "notify_on_first_run": false
+    },
+    "database_path": "data/products.db",
+    "log_file": "data/monitor.log"
+}

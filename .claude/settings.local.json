@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:jumpshop-benelic.com)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\刘天龙\\\\Desktop\\\\jumpshop自动监控\" -Recurse | Where-Object { -not $_.PSIsContainer } | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize)",
+      "PowerShell(gh *)",
+      "PowerShell(winget install *)"
+    ]
+  }
+}
