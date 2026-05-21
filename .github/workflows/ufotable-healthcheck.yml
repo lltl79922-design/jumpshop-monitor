@@ -1,0 +1,75 @@
+name: ufotable Daily Healthcheck
+
+on:
+  schedule:
+    - cron: '17 18 * * *'  # 北京时间 2:17
+    - cron: '17 20 * * *'  # 北京时间 4:17
+    - cron: '17 22 * * *'  # 北京时间 6:17
+  workflow_dispatch:
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Setup config
+        run: cp ufotable_config.example.json ufotable_config.json
+
+      - name: Restore DB cache
+        uses: actions/cache/restore@v4
+        id: cache-db
+        with:
+          path: data/ufotable.db
+          key: ufotable-db-v1
+          restore-keys: |
+            ufotable-db-v1
+
+      - name: Run Healthcheck
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: python ufotable_healthcheck.py
+
+      - name: Auto-Rebuild DB if needed
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          python -c "
+          import sqlite3, sys
+          from pathlib import Path
+          if Path('data/ufotable.db').exists():
+              try:
+                  conn = sqlite3.connect('data/ufotable.db')
+                  result = conn.execute('PRAGMA integrity_check').fetchone()
+                  conn.close()
+                  if result[0] == 'ok':
+                      print('DB OK')
+                      sys.exit(0)
+                  else:
+                      print(f'DB corrupt: {result[0]}')
+              except Exception as e:
+                  print(f'DB error: {e}')
+          else:
+              print('DB not found')
+          sys.exit(1)
+          " || python ufotable_monitor.py --once
+
+      - name: Save DB to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/ufotable.db
+          key: ufotable-db-v1

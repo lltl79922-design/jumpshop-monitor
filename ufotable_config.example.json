@@ -1,0 +1,22 @@
+{
+    "poll_interval_seconds": 300,
+    "notifications": {
+        "feishu": {
+            "enabled": true,
+            "webhook_url": "YOUR_FEISHU_WEBHOOK_URL",
+            "app_id": "YOUR_FEISHU_APP_ID",
+            "app_secret": "YOUR_FEISHU_APP_SECRET",
+            "image_preview": true,
+            "max_image_items": 10
+        }
+    },
+    "monitor_options": {
+        "detect_new_products": true,
+        "detect_restocks": true,
+        "detect_sold_out": true,
+        "detect_price_changes": true,
+        "notify_on_first_run": false
+    },
+    "database_path": "data/ufotable.db",
+    "log_file": "data/ufotable_monitor.log"
+}

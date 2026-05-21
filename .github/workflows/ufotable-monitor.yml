@@ -1,0 +1,97 @@
+name: ufotable WEBSHOP Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Restore DB from cache
+        uses: actions/cache/restore@v4
+        id: cache-db
+        with:
+          path: data/ufotable.db
+          key: ufotable-db-v1
+          restore-keys: |
+            ufotable-db-v1
+
+      - name: Repair DB (clean stale WAL)
+        run: |
+          mkdir -p data
+          rm -f data/ufotable.db-wal data/ufotable.db-shm
+          python -c "
+          import sqlite3
+          try:
+              conn = sqlite3.connect('data/ufotable.db')
+              conn.execute('PRAGMA integrity_check')
+              conn.close()
+          except Exception as e:
+              print(f'DB check skipped: {e}')
+          "
+
+      - name: Setup config
+        run: cp ufotable_config.example.json ufotable_config.json
+
+      - name: Run monitor
+        id: monitor
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: python ufotable_monitor.py --once
+
+      - name: Self-heal on failure
+        if: steps.monitor.outcome == 'failure'
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          echo "Monitor failed, self-healing..."
+          rm -f data/ufotable.db data/ufotable.db-wal data/ufotable.db-shm
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('data/ufotable.db')
+          conn.execute('PRAGMA journal_mode=WAL')
+          conn.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, product_code TEXT, title TEXT, works TEXT, category TEXT, price INTEGER, available INTEGER, image_url TEXT, url TEXT, valid_after TEXT, first_seen TEXT, last_checked TEXT, feishu_img_key TEXT DEFAULT \"\")')
+          conn.execute('CREATE TABLE IF NOT EXISTS change_log (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, change_type TEXT, old_value TEXT, new_value TEXT, detected_at TEXT, notified INTEGER DEFAULT 0)')
+          conn.commit()
+          conn.close()
+          "
+          python ufotable_monitor.py --once
+          echo "Self-heal complete"
+
+      - name: Checkpoint DB
+        if: always()
+        run: |
+          python -c "
+          import sqlite3
+          try:
+              conn = sqlite3.connect('data/ufotable.db')
+              conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+              conn.close()
+          except Exception:
+              pass
+          "
+
+      - name: Save DB to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/ufotable.db
+          key: ufotable-db-v1
