@@ -9,7 +9,7 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - uses: actions/checkout@v4
@@ -26,9 +26,20 @@ jobs:
         id: cache-db
         with:
           path: data/products.db
-          key: jumpshop-db-${{ github.run_number }}
+          key: jumpshop-db-v2
           restore-keys: |
-            jumpshop-db-
+            jumpshop-db-v2
+
+      - name: Repair DB (clean stale WAL)
+        run: |
+          mkdir -p data
+          rm -f data/products.db-wal data/products.db-shm
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('data/products.db')
+          conn.execute('PRAGMA integrity_check')
+          conn.close()
+          "
 
       - name: Setup config
         run: cp config.example.json config.json
@@ -40,9 +51,19 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
         run: python monitor_loop.py --once
 
+      - name: Checkpoint DB (flush WAL to file)
+        if: always()
+        run: |
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('data/products.db')
+          conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+          conn.close()
+          "
+
       - name: Save DB to cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: data/products.db
-          key: jumpshop-db-${{ github.run_number }}
+          key: jumpshop-db-v2
