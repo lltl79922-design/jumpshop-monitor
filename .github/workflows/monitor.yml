@@ -70,6 +70,8 @@ jobs:
           conn.execute('PRAGMA journal_mode=WAL')
           conn.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, title TEXT, handle TEXT, vendor TEXT, tags TEXT, price INTEGER, available INTEGER, sku TEXT, image_url TEXT, url TEXT, published_at TEXT, updated_at TEXT, first_seen TEXT, last_checked TEXT, feishu_img_key TEXT DEFAULT \"\")')
           conn.execute('CREATE TABLE IF NOT EXISTS change_log (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, change_type TEXT, old_value TEXT, new_value TEXT, detected_at TEXT, notified INTEGER DEFAULT 0)')
+          conn.execute('CREATE TABLE IF NOT EXISTS soldout_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), soldout_ids TEXT DEFAULT \"[]\", updated_at TEXT DEFAULT \"\")')
+          conn.execute('INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at) VALUES (1, \"[]\", \"\")')
           conn.commit()
           conn.close()
           "

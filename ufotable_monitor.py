@@ -33,18 +33,17 @@ def load_config(path="ufotable_config.json"):
         with open(path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     else:
-        cfg = json.load(open("config.example.json", "r", encoding="utf-8"))
+        cfg = json.load(open("ufotable_config.example.json", "r", encoding="utf-8"))
 
-    for key in ["FEISHU_WEBHOOK_URL", "FEISHU_APP_ID", "FEISHU_APP_SECRET"]:
-        env_key = key.lower()
-        if os.environ.get(key):
+    env_map = {
+        "FEISHU_WEBHOOK_URL": "webhook_url",
+        "FEISHU_APP_ID": "app_id",
+        "FEISHU_APP_SECRET": "app_secret",
+    }
+    for env_key, cfg_key in env_map.items():
+        if os.environ.get(env_key):
             nc = cfg.setdefault("notifications", {}).setdefault("feishu", {})
-            if "webhook" in env_key:
-                nc["webhook_url"] = os.environ[key]
-            elif "app_id" in env_key:
-                nc["app_id"] = os.environ[key]
-            elif "app_secret" in env_key:
-                nc["app_secret"] = os.environ[key]
+            nc[cfg_key] = os.environ[env_key]
     return cfg
 
 
@@ -92,6 +91,17 @@ def init_db(db_path):
             old_value TEXT, new_value TEXT,
             detected_at TEXT, notified INTEGER DEFAULT 0
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS soldout_snapshot (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            soldout_ids TEXT DEFAULT '[]',
+            updated_at TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at)
+        VALUES (1, '[]', '')
     """)
     conn.commit()
     return conn
@@ -201,6 +211,63 @@ def detect_changes(conn, products, cfg):
                 })
 
     return changes, now_str
+
+
+def detect_soldout_delta(conn, products, cfg, now_str):
+    """快照对比: 检测本轮 vs 上轮售罄商品集合的变化
+    能捕获在两次检测之间发生的 補貨→售罄 事件，弥补 per-product 状态检测的盲区
+    """
+    if not cfg.get("monitor_options", {}).get("detect_sold_out", True):
+        return []
+
+    # 当前售罄商品 ID 集合
+    current_soldout = {p["id"] for p in products if p["available"] == 0}
+
+    # 上次售罄快照
+    row = conn.execute("SELECT soldout_ids FROM soldout_snapshot WHERE id=1").fetchone()
+    if not row or not row[0]:
+        # 首次运行: 写入快照但不产生通知
+        conn.execute("UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
+                     (json.dumps(list(current_soldout)), now_str))
+        conn.commit()
+        return []
+
+    try:
+        last_soldout = set(json.loads(row[0]))
+    except (json.JSONDecodeError, TypeError):
+        last_soldout = set()
+
+    # 计算差值
+    newly_soldout_ids = current_soldout - last_soldout
+    newly_restocked_ids = last_soldout - current_soldout
+
+    # 更新快照
+    conn.execute("UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
+                 (json.dumps(list(current_soldout)), now_str))
+    conn.commit()
+
+    changes = []
+    product_map = {p["id"]: p for p in products}
+
+    for pid in newly_soldout_ids:
+        p = product_map.get(pid)
+        if p:
+            changes.append({
+                "product_id": pid, "change_type": "sold_out",
+                "old_value": "in stock", "new_value": "sold out (snapshot)",
+                "product": p,
+            })
+
+    for pid in newly_restocked_ids:
+        p = product_map.get(pid)
+        if p:
+            changes.append({
+                "product_id": pid, "change_type": "restock",
+                "old_value": "sold out", "new_value": "in stock (snapshot)",
+                "product": p,
+            })
+
+    return changes
 
 
 def update_db(conn, products, now_str):
@@ -418,6 +485,14 @@ def run_once(cfg, conn, is_first_run=False):
 
     products = [normalize_product(p, stock_map) for p in products_raw]
     changes, now_str = detect_changes(conn, products, cfg)
+
+    # 快照对比: 补充 per-product 检测可能漏掉的售罄/補貨
+    snapshot_changes = detect_soldout_delta(conn, products, cfg, now_str)
+    existing_ids = {c["product_id"]: c for c in changes}
+    for sc in snapshot_changes:
+        if sc["product_id"] not in existing_ids:
+            changes.append(sc)
+        # 如果 per-product 已经检测到了，保留原结果(change_type 更精确)
 
     if changes:
         logging.info(f"Detected {len(changes)} changes")

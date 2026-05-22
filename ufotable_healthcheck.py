@@ -31,11 +31,14 @@ def load_config():
     path = "ufotable_config.json" if os.path.exists("ufotable_config.json") else "ufotable_config.example.json"
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    for key in ["FEISHU_WEBHOOK_URL", "FEISHU_APP_ID", "FEISHU_APP_SECRET"]:
-        if os.environ.get(key):
-            cfg.setdefault("notifications", {}).setdefault("feishu", {})[
-                {"FEISHU_WEBHOOK_URL": "webhook_url", "FEISHU_APP_ID": "app_id", "FEISHU_APP_SECRET": "app_secret"}[key]
-            ] = os.environ[key]
+    env_map = {
+        "FEISHU_WEBHOOK_URL": "webhook_url",
+        "FEISHU_APP_ID": "app_id",
+        "FEISHU_APP_SECRET": "app_secret",
+    }
+    for env_key, cfg_key in env_map.items():
+        if os.environ.get(env_key):
+            cfg.setdefault("notifications", {}).setdefault("feishu", {})[cfg_key] = os.environ[env_key]
     return cfg
 
 

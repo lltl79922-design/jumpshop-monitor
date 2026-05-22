@@ -87,6 +87,17 @@ def init_db(db_path):
             detected_at TEXT, notified INTEGER DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS soldout_snapshot (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            soldout_ids TEXT DEFAULT '[]',
+            updated_at TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at)
+        VALUES (1, '[]', '')
+    """)
     conn.commit()
     return conn
 
@@ -192,6 +203,57 @@ def detect_changes(conn, products, cfg):
                 })
 
     return changes, now_str
+
+
+def detect_soldout_delta(conn, products, cfg, now_str):
+    """快照对比: 检测本轮 vs 上轮售罄商品集合的变化"""
+    if not cfg["monitor_options"].get("detect_sold_out", True):
+        return []
+
+    current_soldout = {p["id"] for p in products if p["available"] == 0}
+
+    row = conn.execute("SELECT soldout_ids FROM soldout_snapshot WHERE id=1").fetchone()
+    if not row or not row[0]:
+        conn.execute("UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
+                     (json.dumps(list(current_soldout)), now_str))
+        conn.commit()
+        return []
+
+    try:
+        last_soldout = set(json.loads(row[0]))
+    except (json.JSONDecodeError, TypeError):
+        last_soldout = set()
+
+    newly_soldout_ids = current_soldout - last_soldout
+    newly_restocked_ids = last_soldout - current_soldout
+
+    conn.execute("UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
+                 (json.dumps(list(current_soldout)), now_str))
+    conn.commit()
+
+    changes = []
+    product_map = {p["id"]: p for p in products}
+
+    for pid in newly_soldout_ids:
+        p = product_map.get(pid)
+        if p:
+            changes.append({
+                "product_id": pid, "change_type": "sold_out",
+                "old_value": "in stock", "new_value": "sold out (snapshot)",
+                "product": p,
+            })
+
+    for pid in newly_restocked_ids:
+        p = product_map.get(pid)
+        if p:
+            changes.append({
+                "product_id": pid, "change_type": "restock",
+                "old_value": "sold out", "new_value": "in stock (snapshot)",
+                "product": p,
+            })
+
+    return changes
+
 
 # ---------------------------------------------------------------------------
 # 数据库更新
@@ -562,6 +624,13 @@ def run_once(cfg, conn, is_first_run=False):
 
     products = [normalize_product(p) for p in products_raw]
     changes, now_str = detect_changes(conn, products, cfg)
+
+    # 快照对比: 补充 per-product 检测可能漏掉的售罄/補貨
+    snapshot_changes = detect_soldout_delta(conn, products, cfg, now_str)
+    existing_ids = {c["product_id"]: c for c in changes}
+    for sc in snapshot_changes:
+        if sc["product_id"] not in existing_ids:
+            changes.append(sc)
 
     if changes:
         logging.info(f"Detected {len(changes)} changes")

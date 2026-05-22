@@ -137,6 +137,17 @@ def repair_database(db_path):
                 detected_at TEXT, notified INTEGER DEFAULT 0
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS soldout_snapshot (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                soldout_ids TEXT DEFAULT '[]',
+                updated_at TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at)
+            VALUES (1, '[]', '')
+        """)
         conn.commit()
         conn.close()
         logging.info("Database reinitialized successfully")
