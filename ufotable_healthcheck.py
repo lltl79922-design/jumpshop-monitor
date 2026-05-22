@@ -6,25 +6,14 @@ import os
 import sys
 import sqlite3
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
 
-JST = timezone(timedelta(hours=9))
+from common import JST, setup_logging
+
 API_BASE = "https://client-api.modd.com/UFWE"
-
-
-def setup_logging():
-    Path("data").mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [UFOTABLE-HEALTH] %(message)s",
-        handlers=[
-            logging.FileHandler("data/ufotable_healthcheck.log", encoding="utf-8"),
-            logging.StreamHandler()
-        ]
-    )
 
 
 def load_config():
@@ -89,7 +78,7 @@ def check_api():
 
 
 def main():
-    setup_logging()
+    setup_logging("data/ufotable_healthcheck.log")
     cfg = load_config()
     db_path = cfg.get("database_path", "data/ufotable.db")
 
@@ -104,7 +93,6 @@ def main():
     if api_ok and db_ok:
         status, details = "ok", f"  全部正常\n  API: {api_msg}\n  DB: {db_msg}"
     elif not db_ok:
-        # 尝试修复
         status, details = "warn", f"  数据库问题: {db_msg}\n  自动重建中..."
         for f in [Path(db_path), Path(db_path + "-wal"), Path(db_path + "-shm")]:
             if f.exists():

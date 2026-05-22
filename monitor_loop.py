@@ -17,13 +17,26 @@ import random
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
 
-JST = timezone(timedelta(hours=9))
+from common import (
+    JST, CHANGE_LABELS,
+    setup_logging, log_changes,
+    ensure_image_keys,
+    detect_soldout_delta, build_feishu_card, send_feishu_card,
+)
+
 running = True
+
+JUMP_SHOP_CARD = {
+    "name": "JUMP SHOP",
+    "template_color": "red",
+    "footer": "Jump Shop Monitor",
+    "subtitle_field": "vendor",
+}
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -32,7 +45,6 @@ def load_config(path="config.json"):
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    # 环境变量覆盖敏感信息 (用于 GitHub Actions)
     if os.environ.get("FEISHU_WEBHOOK_URL"):
         cfg["notifications"]["feishu"]["webhook_url"] = os.environ["FEISHU_WEBHOOK_URL"]
     if os.environ.get("FEISHU_APP_ID"):
@@ -41,20 +53,6 @@ def load_config(path="config.json"):
         cfg["notifications"]["feishu"]["app_secret"] = os.environ["FEISHU_APP_SECRET"]
 
     return cfg
-
-# ---------------------------------------------------------------------------
-# 日志
-# ---------------------------------------------------------------------------
-def setup_logging(log_file):
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler()
-        ]
-    )
 
 # ---------------------------------------------------------------------------
 # 数据库
@@ -74,7 +72,6 @@ def init_db(db_path):
             feishu_img_key TEXT DEFAULT ''
         )
     """)
-    # 迁移: 如果旧表没有 feishu_img_key 列则添加
     try:
         conn.execute("SELECT feishu_img_key FROM products LIMIT 1")
     except sqlite3.OperationalError:
@@ -204,57 +201,6 @@ def detect_changes(conn, products, cfg):
 
     return changes, now_str
 
-
-def detect_soldout_delta(conn, products, cfg, now_str):
-    """快照对比: 检测本轮 vs 上轮售罄商品集合的变化"""
-    if not cfg["monitor_options"].get("detect_sold_out", True):
-        return []
-
-    current_soldout = {p["id"] for p in products if p["available"] == 0}
-
-    row = conn.execute("SELECT soldout_ids FROM soldout_snapshot WHERE id=1").fetchone()
-    if not row or not row[0]:
-        conn.execute("UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
-                     (json.dumps(list(current_soldout)), now_str))
-        conn.commit()
-        return []
-
-    try:
-        last_soldout = set(json.loads(row[0]))
-    except (json.JSONDecodeError, TypeError):
-        last_soldout = set()
-
-    newly_soldout_ids = current_soldout - last_soldout
-    newly_restocked_ids = last_soldout - current_soldout
-
-    conn.execute("UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
-                 (json.dumps(list(current_soldout)), now_str))
-    conn.commit()
-
-    changes = []
-    product_map = {p["id"]: p for p in products}
-
-    for pid in newly_soldout_ids:
-        p = product_map.get(pid)
-        if p:
-            changes.append({
-                "product_id": pid, "change_type": "sold_out",
-                "old_value": "in stock", "new_value": "sold out (snapshot)",
-                "product": p,
-            })
-
-    for pid in newly_restocked_ids:
-        p = product_map.get(pid)
-        if p:
-            changes.append({
-                "product_id": pid, "change_type": "restock",
-                "old_value": "sold out", "new_value": "in stock (snapshot)",
-                "product": p,
-            })
-
-    return changes
-
-
 # ---------------------------------------------------------------------------
 # 数据库更新
 # ---------------------------------------------------------------------------
@@ -274,233 +220,9 @@ def update_db(conn, products, now_str):
               p["published_at"], p["updated_at"], now_str, now_str))
     conn.commit()
 
-def log_changes(conn, changes, now_str):
-    for c in changes:
-        conn.execute(
-            "INSERT INTO change_log (product_id, change_type, old_value, new_value, detected_at) VALUES (?, ?, ?, ?, ?)",
-            (c["product_id"], c["change_type"], c["old_value"], c["new_value"], now_str))
-    conn.commit()
-
-# ---------------------------------------------------------------------------
-# 飞书 API 工具
-# ---------------------------------------------------------------------------
-# token 缓存 (有效期2小时)
-_feishu_token = None
-_feishu_token_expiry = 0
-
-
-def get_feishu_token(app_id, app_secret):
-    global _feishu_token, _feishu_token_expiry
-    now = time.time()
-    if _feishu_token and now < _feishu_token_expiry - 60:
-        return _feishu_token
-
-    r = requests.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                       json={"app_id": app_id, "app_secret": app_secret}, timeout=15)
-    data = r.json()
-    if data.get("code") != 0:
-        raise Exception(f"Feishu auth failed: {data}")
-    _feishu_token = data["tenant_access_token"]
-    _feishu_token_expiry = now + data.get("expire", 7200)
-    return _feishu_token
-
-
-def upload_image_to_feishu(image_url, app_id, app_secret):
-    """下载商品图并上传飞书, 返回 image_key 或空字符串"""
-    try:
-        token = get_feishu_token(app_id, app_secret)
-        img_data = requests.get(image_url, timeout=15).content
-        r = requests.post("https://open.feishu.cn/open-apis/im/v1/images",
-                          headers={"Authorization": f"Bearer {token}"},
-                          files={"image": ("product.jpg", img_data, "image/jpeg")},
-                          data={"image_type": "message"},
-                          timeout=20)
-        result = r.json()
-        if result.get("code") == 0:
-            return result["data"]["image_key"]
-        else:
-            logging.warning(f"Feishu image upload failed: {result}")
-            return ""
-    except Exception as e:
-        logging.warning(f"Feishu image upload error: {e}")
-        return ""
-
-
-def ensure_image_keys(conn, changes, feishu_cfg):
-    """为变更商品获取飞书图片key, 优先用缓存"""
-    app_id = feishu_cfg.get("app_id", "")
-    app_secret = feishu_cfg.get("app_secret", "")
-    if not app_id or not app_secret:
-        return
-
-    max_images = feishu_cfg.get("max_image_items", 10)
-    count = 0
-
-    for c in changes:
-        if count >= max_images:
-            break
-        p = c["product"]
-        if not p.get("image_url"):
-            continue
-
-        # 查数据库缓存
-        row = conn.execute("SELECT feishu_img_key FROM products WHERE id=?", (p["id"],)).fetchone()
-        if row and row[0]:
-            p["feishu_img_key"] = row[0]
-            count += 1
-            continue
-
-        # 上传图片
-        logging.info(f"Uploading image for: {p['title'][:40]}...")
-        img_key = upload_image_to_feishu(p["image_url"], app_id, app_secret)
-        if img_key:
-            p["feishu_img_key"] = img_key
-            conn.execute("UPDATE products SET feishu_img_key=? WHERE id=?", (img_key, p["id"]))
-            conn.commit()
-            count += 1
-        time.sleep(0.2)  # 避免请求过快
-
 # ---------------------------------------------------------------------------
 # 通知
 # ---------------------------------------------------------------------------
-CHANGE_LABELS = {
-    "new": "[NEW]",
-    "restock": "[RESTOCK]",
-    "sold_out": "[SOLD OUT]",
-    "price_change": "[PRICE]",
-}
-
-
-def build_feishu_card(changes, now_str):
-    """构建飞书交互式卡片 - 带图片预览 + 商品链接按钮"""
-    total = len(changes)
-    new_count = sum(1 for c in changes if c["change_type"] == "new")
-    restock_count = sum(1 for c in changes if c["change_type"] == "restock")
-    soldout_count = sum(1 for c in changes if c["change_type"] == "sold_out")
-    price_count = sum(1 for c in changes if c["change_type"] == "price_change")
-
-    elements = [
-        {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": f"  {new_count}  **|**    {restock_count}  **|**    {soldout_count}  **|**    {price_count}"
-            }
-        },
-        {"tag": "hr"}
-    ]
-
-    type_order = [
-        ("new", "  新商品上架"),
-        ("restock", "  補貨"),
-        ("sold_out", "  售罄"),
-        ("price_change", "  価格変更"),
-    ]
-
-    max_items = 15
-    shown = 0
-
-    for ctype, header in type_order:
-        items = [c for c in changes if c["change_type"] == ctype]
-        if not items:
-            continue
-
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**{header} ({len(items)}件)**"}
-        })
-
-        for c in items:
-            if shown >= max_items:
-                break
-
-            p = c["product"]
-            status_icon = "  " if p["available"] else "  "
-            status_text = "在庫あり" if p["available"] else "在庫なし"
-            price_yen = f"  {p['price']:,}"
-            vendor = p.get("vendor", "")
-            img_key = p.get("feishu_img_key", "")
-
-            product_md = f"**{p['title']}**\n{price_yen} | {vendor} | {status_icon} {status_text}"
-            if ctype == "price_change":
-                product_md += f"\n{c['old_value']}    {c['new_value']}"
-
-            # 有图片: 左右分栏布局 (图片 | 信息)
-            if img_key:
-                elements.append({
-                    "tag": "column_set",
-                    "flex_mode": "bisect",
-                    "background_style": "default",
-                    "columns": [
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 2,
-                            "elements": [{
-                                "tag": "img",
-                                "img_key": img_key,
-                                "alt": {"tag": "plain_text", "content": ""},
-                                "preview": True,
-                                "mode": "fit_horizontal"
-                            }]
-                        },
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 3,
-                            "elements": [{
-                                "tag": "div",
-                                "text": {"tag": "lark_md", "content": product_md}
-                            }]
-                        }
-                    ]
-                })
-            else:
-                elements.append({
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": product_md}
-                })
-
-            # 按钮
-            elements.append({
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "  商品ページ"},
-                    "type": "default",
-                    "url": p["url"]
-                }]
-            })
-
-            shown += 1
-
-        if shown >= max_items:
-            break
-
-    if total > max_items:
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"...    他 {total - max_items} 件  変更"}
-        })
-
-    elements.append({"tag": "hr"})
-    elements.append({
-        "tag": "note",
-        "elements": [{"tag": "plain_text", "content": f"  {now_str}  |  Jump Shop Monitor"}]
-    })
-
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "  JUMP SHOP 商品監視"},
-            "template": "red"
-        },
-        "elements": elements
-    }
-
-    return {"msg_type": "interactive", "card": card}
-
-
 def format_text_message(changes, now_str):
     """纯文本通知(企业微信/邮件等)"""
     total = len(changes)
@@ -544,21 +266,9 @@ def format_text_message(changes, now_str):
 def send_feishu(feishu_cfg, changes, now_str):
     """飞书交互式卡片通知(含图片预览)"""
     webhook_url = feishu_cfg["webhook_url"]
-    payload = build_feishu_card(changes, now_str)
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=15)
-        result = resp.json()
-        if result.get("code") == 0:
-            logging.info("Feishu card notification sent")
-        else:
-            logging.error(f"Feishu card error: {result}")
-            # 降级为纯文本
-            text = "JUMP SHOP Monitor\n\n" + format_text_message(changes, now_str)[:8000]
-            resp2 = requests.post(webhook_url, json={"msg_type": "text", "content": {"text": text}}, timeout=15)
-            if resp2.json().get("code") == 0:
-                logging.info("Feishu fallback text sent")
-    except Exception as e:
-        logging.error(f"Feishu send failed: {e}")
+    payload = build_feishu_card(changes, now_str, JUMP_SHOP_CARD)
+    fallback = "JUMP SHOP Monitor\n\n" + format_text_message(changes, now_str)[:8000]
+    send_feishu_card(webhook_url, payload, fallback)
 
 
 def send_wechat_work(webhook_url, changes, now_str):
@@ -598,7 +308,6 @@ def send_notifications(cfg, conn, changes, now_str):
         return
     nc = cfg["notifications"]
 
-    # 飞书: 先上传图片再发卡片
     if nc.get("feishu", {}).get("enabled"):
         feishu_cfg = nc["feishu"]
         if feishu_cfg.get("image_preview") and feishu_cfg.get("app_id"):
@@ -626,7 +335,8 @@ def run_once(cfg, conn, is_first_run=False):
     changes, now_str = detect_changes(conn, products, cfg)
 
     # 快照对比: 补充 per-product 检测可能漏掉的售罄/補貨
-    snapshot_changes = detect_soldout_delta(conn, products, cfg, now_str)
+    detect_sold_out = cfg["monitor_options"].get("detect_sold_out", True)
+    snapshot_changes = detect_soldout_delta(conn, products, detect_sold_out, now_str)
     existing_ids = {c["product_id"]: c for c in changes}
     for sc in snapshot_changes:
         if sc["product_id"] not in existing_ids:

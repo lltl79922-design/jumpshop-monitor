@@ -12,28 +12,15 @@ import json
 import os
 import sys
 import sqlite3
-import time
-import random
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
 
-JST = timezone(timedelta(hours=9))
+from common import JST, setup_logging
+
 HEALTHCHECK_LOG = "data/healthcheck.log"
-
-
-def setup_logging():
-    Path(HEALTHCHECK_LOG).parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [HEALTH] %(message)s",
-        handlers=[
-            logging.FileHandler(HEALTHCHECK_LOG, encoding="utf-8"),
-            logging.StreamHandler()
-        ]
-    )
 
 
 def load_config():
@@ -75,7 +62,6 @@ def check_database(db_path):
     if not Path(db_path).exists():
         return False, "数据库文件不存在 (首次运行?)"
 
-    # 清理残留 WAL
     wal = db_path + "-wal"
     shm = db_path + "-shm"
     for f in [wal, shm]:
@@ -99,13 +85,11 @@ def check_database(db_path):
 def repair_database(db_path):
     """修复/重建数据库"""
     logging.info("Attempting database repair...")
-    # 备份损坏的数据库
     backup = db_path + ".broken"
     if Path(db_path).exists():
         Path(db_path).rename(backup)
         logging.info(f"Corrupted DB backed up to {backup}")
 
-    # 清理 WAL
     for suffix in ["-wal", "-shm", "-broken"]:
         p = Path(db_path + suffix)
         if p.exists():
@@ -114,7 +98,6 @@ def repair_database(db_path):
             except Exception:
                 pass
 
-    # 重新初始化
     try:
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -257,22 +240,19 @@ def run_full_check(cfg):
     logging.info(f"自检结论: {status}")
     logging.info(details_str)
 
-    # 发送报告
     send_health_report(cfg, status, details_str)
 
     return status
 
 
 def main():
-    setup_logging()
+    setup_logging(HEALTHCHECK_LOG)
     cfg = load_config()
 
-    # 如果是完整重建模式
     if "--rebuild" in sys.argv:
         db_path = cfg.get("database_path", "data/products.db")
         repair_database(db_path)
         logging.info("Database rebuild complete. Running full scan...")
-        # 运行 monitor 重建数据
         import monitor_loop
         conn = monitor_loop.init_db(db_path)
         monitor_loop.run_once(cfg, conn, is_first_run=True)
@@ -280,7 +260,6 @@ def main():
         logging.info("Rebuild + full scan complete")
         return
 
-    # 标准自检
     run_full_check(cfg)
 
 
