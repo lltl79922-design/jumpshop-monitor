@@ -1,6 +1,13 @@
 name: ufotable Daily Healthcheck
 
 on:
+  push:
+    paths:
+      - 'ufotable_healthcheck.py'
+      - 'ufotable_monitor.py'
+      - 'common.py'
+      - 'ufotable_config.example.json'
+      - '.github/workflows/ufotable-healthcheck.yml'
   schedule:
     - cron: '17 18 * * *'  # 北京时间 2:17
     - cron: '17 20 * * *'  # 北京时间 4:17

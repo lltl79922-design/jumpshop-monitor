@@ -1,6 +1,12 @@
 name: Jump Shop Monitor
 
 on:
+  push:
+    paths:
+      - 'monitor_loop.py'
+      - 'common.py'
+      - 'config.example.json'
+      - '.github/workflows/monitor.yml'
   schedule:
     # 每5分钟运行 (北京时间/东京时间)
     - cron: '*/5 * * * *'

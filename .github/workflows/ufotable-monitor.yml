@@ -1,6 +1,12 @@
 name: ufotable WEBSHOP Monitor
 
 on:
+  push:
+    paths:
+      - 'ufotable_monitor.py'
+      - 'common.py'
+      - 'ufotable_config.example.json'
+      - '.github/workflows/ufotable-monitor.yml'
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:

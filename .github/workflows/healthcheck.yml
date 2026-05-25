@@ -1,6 +1,12 @@
 name: Daily Healthcheck
 
 on:
+  push:
+    paths:
+      - 'healthcheck.py'
+      - 'common.py'
+      - 'config.example.json'
+      - '.github/workflows/healthcheck.yml'
   schedule:
     # 北京时间 2:00 = UTC 18:00
     - cron: '37 18 * * *'
