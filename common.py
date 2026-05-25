@@ -86,12 +86,7 @@ def ensure_image_keys(conn, changes, feishu_cfg):
     if not app_id or not app_secret:
         return
 
-    max_images = feishu_cfg.get("max_image_items", 10)
-    count = 0
-
     for c in changes:
-        if count >= max_images:
-            break
         p = c["product"]
         if not p.get("image_url"):
             continue
@@ -99,7 +94,6 @@ def ensure_image_keys(conn, changes, feishu_cfg):
         row = conn.execute("SELECT feishu_img_key FROM products WHERE id=?", (p["id"],)).fetchone()
         if row and row[0]:
             p["feishu_img_key"] = row[0]
-            count += 1
             continue
 
         logging.info(f"Uploading image for: {p['title'][:40]}...")
@@ -108,7 +102,6 @@ def ensure_image_keys(conn, changes, feishu_cfg):
             p["feishu_img_key"] = img_key
             conn.execute("UPDATE products SET feishu_img_key=? WHERE id=?", (img_key, p["id"]))
             conn.commit()
-            count += 1
         time.sleep(0.2)
 
 # =============================================================================
@@ -189,12 +182,19 @@ def build_feishu_card(changes, now_str, shop_config):
     soldout_count = sum(1 for c in changes if c["change_type"] == "sold_out")
     price_count = sum(1 for c in changes if c["change_type"] == "price_change")
 
+    parts = []
+    if new_count: parts.append(f"上新 {new_count}")
+    if restock_count: parts.append(f"補貨 {restock_count}")
+    if soldout_count: parts.append(f"售罄 {soldout_count}")
+    if price_count: parts.append(f"価格変更 {price_count}")
+    summary = "  |  ".join(parts) if parts else "  状態変更なし"
+
     elements = [
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": f"  {new_count}  **|**    {restock_count}  **|**    {soldout_count}  **|**    {price_count}"
+                "content": f"  {summary}"
             }
         },
         {"tag": "hr"}
@@ -207,7 +207,7 @@ def build_feishu_card(changes, now_str, shop_config):
         ("price_change", "  価格変更"),
     ]
 
-    max_items = 15
+    max_items = 50
     shown = 0
     subtitle_field = shop_config.get("subtitle_field", "vendor")
 
@@ -289,9 +289,10 @@ def build_feishu_card(changes, now_str, shop_config):
             break
 
     if total > max_items:
+        over = total - max_items
         elements.append({
             "tag": "div",
-            "text": {"tag": "lark_md", "content": f"...    他 {total - max_items} 件  変更"}
+            "text": {"tag": "lark_md", "content": f"  他 {over} 件の変更は省略されました（表示上限 {max_items} 件）"}
         })
 
     elements.append({"tag": "hr"})

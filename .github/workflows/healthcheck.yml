@@ -33,9 +33,9 @@ jobs:
         id: cache-db
         with:
           path: data/products.db
-          key: jumpshop-db-v2
+          key: jumpshop-db-v2-${{ github.run_id }}
           restore-keys: |
-            jumpshop-db-v2
+            jumpshop-db-v2-
 
       - name: Run Healthcheck
         env:
@@ -78,4 +78,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: data/products.db
-          key: jumpshop-db-v2
+          key: jumpshop-db-v2-${{ github.run_id }}

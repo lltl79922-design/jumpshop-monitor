@@ -26,9 +26,9 @@ jobs:
         id: cache-db
         with:
           path: data/products.db
-          key: jumpshop-db-v2
+          key: jumpshop-db-v2-${{ github.run_id }}
           restore-keys: |
-            jumpshop-db-v2
+            jumpshop-db-v2-
 
       - name: Repair DB (clean stale WAL)
         run: |
@@ -76,7 +76,7 @@ jobs:
           conn.close()
           "
           # 重新运行监控(建立新基线)
-          python monitor_loop.py --once
+          python monitor_loop.py --once --silent
           echo "Self-heal complete"
 
       - name: Checkpoint DB (flush WAL to file)
@@ -94,4 +94,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: data/products.db
-          key: jumpshop-db-v2
+          key: jumpshop-db-v2-${{ github.run_id }}

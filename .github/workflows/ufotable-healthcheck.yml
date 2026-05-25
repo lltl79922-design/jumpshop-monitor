@@ -30,9 +30,9 @@ jobs:
         id: cache-db
         with:
           path: data/ufotable.db
-          key: ufotable-db-v1
+          key: ufotable-db-v1-${{ github.run_id }}
           restore-keys: |
-            ufotable-db-v1
+            ufotable-db-v1-
 
       - name: Run Healthcheck
         env:
@@ -65,11 +65,11 @@ jobs:
           else:
               print('DB not found')
           sys.exit(1)
-          " || python ufotable_monitor.py --once
+          " || python ufotable_monitor.py --once --silent
 
       - name: Save DB to cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: data/ufotable.db
-          key: ufotable-db-v1
+          key: ufotable-db-v1-${{ github.run_id }}

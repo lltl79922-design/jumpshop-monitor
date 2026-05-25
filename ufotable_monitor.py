@@ -245,7 +245,7 @@ def send_notifications(cfg, conn, changes, now_str):
         send_feishu(feishu_cfg, changes, now_str)
 
 
-def run_once(cfg, conn, is_first_run=False):
+def run_once(cfg, conn, is_first_run=False, silent=False):
     start = time.time()
     logging.info("Checking ufotable WEBSHOP...")
 
@@ -273,8 +273,10 @@ def run_once(cfg, conn, is_first_run=False):
         if len(changes) > 10:
             logging.info(f"  ... and {len(changes)-10} more")
 
-        if not is_first_run or cfg.get("monitor_options", {}).get("notify_on_first_run"):
+        if not silent and (not is_first_run or cfg.get("monitor_options", {}).get("notify_on_first_run")):
             send_notifications(cfg, conn, changes, now_str)
+        elif silent:
+            logging.info("Silent mode - skipping notifications")
         log_changes(conn, changes, now_str)
     else:
         logging.info("No changes")
@@ -308,8 +310,10 @@ def main():
     if is_first_run:
         logging.info("First run - building baseline database...")
 
+    silent = "--silent" in sys.argv
+
     if "--once" in sys.argv:
-        run_once(cfg, conn, is_first_run=is_first_run)
+        run_once(cfg, conn, is_first_run=is_first_run, silent=silent)
         conn.close()
         return
 
@@ -318,7 +322,7 @@ def main():
 
     while running:
         try:
-            run_once(cfg, conn, is_first_run=is_first_run)
+            run_once(cfg, conn, is_first_run=is_first_run, silent=silent)
             is_first_run = False
         except Exception as e:
             logging.error(f"Run failed: {e}", exc_info=True)

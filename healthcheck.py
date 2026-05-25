@@ -255,7 +255,7 @@ def main():
         logging.info("Database rebuild complete. Running full scan...")
         import monitor_loop
         conn = monitor_loop.init_db(db_path)
-        monitor_loop.run_once(cfg, conn, is_first_run=True)
+        monitor_loop.run_once(cfg, conn, is_first_run=True, silent=True)
         conn.close()
         logging.info("Rebuild + full scan complete")
         return

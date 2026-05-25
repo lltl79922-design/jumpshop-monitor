@@ -25,9 +25,9 @@ jobs:
         id: cache-db
         with:
           path: data/ufotable.db
-          key: ufotable-db-v1
+          key: ufotable-db-v1-${{ github.run_id }}
           restore-keys: |
-            ufotable-db-v1
+            ufotable-db-v1-
 
       - name: Repair DB (clean stale WAL)
         run: |
@@ -75,7 +75,7 @@ jobs:
           conn.commit()
           conn.close()
           "
-          python ufotable_monitor.py --once
+          python ufotable_monitor.py --once --silent
           echo "Self-heal complete"
 
       - name: Checkpoint DB
@@ -96,4 +96,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: data/ufotable.db
-          key: ufotable-db-v1
+          key: ufotable-db-v1-${{ github.run_id }}

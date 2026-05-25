@@ -12,8 +12,7 @@
             "webhook_url": "YOUR_FEISHU_WEBHOOK_URL",
             "app_id": "YOUR_FEISHU_APP_ID",
             "app_secret": "YOUR_FEISHU_APP_SECRET",
-            "image_preview": true,
-            "max_image_items": 10
+            "image_preview": true
         },
         "wechat_work": {
             "enabled": false,
