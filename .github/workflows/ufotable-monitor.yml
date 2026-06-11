@@ -8,7 +8,7 @@ on:
       - 'ufotable_config.example.json'
       - '.github/workflows/ufotable-monitor.yml'
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch:
 
 jobs:

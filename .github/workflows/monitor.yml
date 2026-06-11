@@ -8,8 +8,8 @@ on:
       - 'config.example.json'
       - '.github/workflows/monitor.yml'
   schedule:
-    # 每5分钟运行 (北京时间/东京时间)
-    - cron: '*/5 * * * *'
+    # 每分钟运行 (北京时间/东京时间)
+    - cron: '* * * * *'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
