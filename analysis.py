@@ -67,10 +67,30 @@ def load_sellout_data(db_path, days=None, vendor=None, threshold=None, shop_type
     # 基础查询: 关联 change_log 和 products, 只取售罄事件
     vendor_field = "vendor" if shop_type == "jumpshop" else "works"
 
+    # 检查 products 表中有哪些时间列 (jumpshop: published_at, ufotable: valid_after)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()]
+    has_valid_after = "valid_after" in columns
+    has_published_at = "published_at" in columns
+    has_last_available = "last_available_at" in columns
+
+    time_cols = ["p.first_seen"]
+    if has_published_at:
+        time_cols.append("p.published_at")
+    else:
+        time_cols.append("NULL AS published_at")
+    if has_valid_after:
+        time_cols.append("p.valid_after")
+    else:
+        time_cols.append("NULL AS valid_after")
+    if has_last_available:
+        time_cols.append("p.last_available_at")
+    else:
+        time_cols.append("NULL AS last_available_at")
+
     query = f"""
         SELECT cl.product_id, p.title, p.{vendor_field} AS vendor,
-               p.price, p.first_seen, p.published_at, p.valid_after,
-               p.last_available_at, cl.detected_at
+               p.price, {', '.join(time_cols)},
+               cl.detected_at
         FROM change_log cl
         JOIN products p ON p.id = cl.product_id
         WHERE cl.change_type = 'sold_out'
@@ -244,12 +264,13 @@ def print_summary(results):
     print(f"  闪电售罄 (≤5分): {len(lightning)} ({len(lightning)*100//len(timed) if timed else 0}%)")
     print(f"  瞬间售罄 (≤1分): {len(instant)}")
     if timed:
-        print(f"  最快售罄: {format_seconds(min(timed))}")
-        print(f"  最慢售罄: {format_seconds(max(timed))}")
-        print(f"  平均售罄: {format_seconds(sum(timed) // len(timed))}")
+        times = [r["sellout_seconds"] for r in timed]
+        print(f"  最快售罄: {format_seconds(min(times))}")
+        print(f"  最慢售罄: {format_seconds(max(times))}")
+        print(f"  平均售罄: {format_seconds(sum(times) // len(times))}")
         # 中位数
-        sorted_times = sorted(timed, key=lambda r: r["sellout_seconds"])
-        median = sorted_times[len(sorted_times) // 2]["sellout_seconds"]
+        sorted_times = sorted(times)
+        median = sorted_times[len(sorted_times) // 2]
         print(f"  中位数: {format_seconds(median)}")
 
 
