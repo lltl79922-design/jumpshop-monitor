@@ -27,6 +27,8 @@ from common import (
     setup_logging, log_changes,
     ensure_image_keys,
     detect_soldout_delta, build_feishu_card, send_feishu_card,
+    save_state_snapshot, build_snapshot_from_db,
+    load_state_snapshot, detect_changes_from_snapshot,
 )
 
 running = True
@@ -322,7 +324,7 @@ def send_notifications(cfg, conn, changes, now_str):
 # ---------------------------------------------------------------------------
 # 单次检查
 # ---------------------------------------------------------------------------
-def run_once(cfg, conn, is_first_run=False, silent=False):
+def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
     start = time.time()
     logging.info("Checking Jump Shop...")
 
@@ -332,16 +334,33 @@ def run_once(cfg, conn, is_first_run=False, silent=False):
         return 0
 
     products = [normalize_product(p) for p in products_raw]
-    changes, now_str = detect_changes(conn, products, cfg)
+    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+
+    # 灾难恢复: 自愈/缓存故障后，用旧快照对比当前API数据，补上遗漏事件
+    recovered_changes = []
+    if recover_from:
+        old_snapshot = load_state_snapshot(recover_from)
+        if old_snapshot:
+            recovered_changes = detect_changes_from_snapshot(old_snapshot, products, cfg)
+            logging.info(f"Recovered {len(recovered_changes)} changes from snapshot ({len(old_snapshot)} old products)")
+
+    changes, _ = detect_changes(conn, products, cfg)
 
     # 快照对比: 补充 per-product 检测可能漏掉的售罄/補貨
     detect_sold_out = cfg["monitor_options"].get("detect_sold_out", True)
     snapshot_changes = detect_soldout_delta(conn, products, detect_sold_out, now_str)
+
+    # 合并: per-product > snapshot > recovered (去重)
     existing_ids = {c["product_id"]: c for c in changes}
     for sc in snapshot_changes:
         if sc["product_id"] not in existing_ids:
             changes.append(sc)
+            existing_ids.add(sc["product_id"])
+    for rc in recovered_changes:
+        if rc["product_id"] not in existing_ids:
+            changes.append(rc)
 
+    # 通知策略: 恢复模式下仅发送从快照恢复的变更，避免"全量上新"轰炸
     if changes:
         logging.info(f"Detected {len(changes)} changes")
         for c in changes[:10]:
@@ -350,15 +369,29 @@ def run_once(cfg, conn, is_first_run=False, silent=False):
         if len(changes) > 10:
             logging.info(f"  ... and {len(changes)-10} more")
 
-        if not silent and (not is_first_run or cfg["monitor_options"].get("notify_on_first_run")):
-            send_notifications(cfg, conn, changes, now_str)
-        elif silent:
+        if silent:
             logging.info("Silent mode - skipping notifications")
+        elif is_first_run and recovered_changes and not cfg["monitor_options"].get("notify_on_first_run"):
+            notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
+            logging.info(f"Recovery mode: sending {len(notify_changes)}/{len(changes)} recovered changes")
+            if notify_changes:
+                send_notifications(cfg, conn, notify_changes, now_str)
+        elif not is_first_run or cfg["monitor_options"].get("notify_on_first_run"):
+            send_notifications(cfg, conn, changes, now_str)
         log_changes(conn, changes, now_str)
     else:
         logging.info("No changes")
 
     update_db(conn, products, now_str)
+
+    # 每次成功运行后保存状态快照，用于灾难恢复
+    snapshot_path = cfg.get("state_snapshot_path", "data/state_snapshot.json")
+    try:
+        snapshot_data = build_snapshot_from_db(conn)
+        save_state_snapshot(snapshot_data, snapshot_path)
+    except Exception as e:
+        logging.warning(f"Failed to save state snapshot: {e}")
+
     elapsed = time.time() - start
     logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked")
     return len(changes)
@@ -389,8 +422,15 @@ def main():
     once = "--once" in sys.argv
     silent = "--silent" in sys.argv
 
+    recover_from = None
+    for arg in sys.argv:
+        if arg.startswith("--recover-from="):
+            recover_from = arg.split("=", 1)[1]
+        elif arg == "--recover-from" and sys.argv.index(arg) + 1 < len(sys.argv):
+            recover_from = sys.argv[sys.argv.index(arg) + 1]
+
     if once:
-        run_once(cfg, conn, is_first_run=is_first_run, silent=silent)
+        run_once(cfg, conn, is_first_run=is_first_run, silent=silent, recover_from=recover_from)
         conn.close()
         return
 
@@ -399,8 +439,9 @@ def main():
 
     while running:
         try:
-            run_once(cfg, conn, is_first_run=is_first_run, silent=silent)
+            run_once(cfg, conn, is_first_run=is_first_run, silent=silent, recover_from=recover_from)
             is_first_run = False
+            recover_from = None  # only recover on first iteration
         except Exception as e:
             logging.error(f"Run failed: {e}", exc_info=True)
 

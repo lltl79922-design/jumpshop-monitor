@@ -103,7 +103,10 @@ def main():
 
     logging.info(f"结论: {status}")
     logging.info(details)
-    send_report(cfg, status, details)
+    if status in ("warn", "fail"):
+        send_report(cfg, status, details)
+    else:
+        logging.info("自检一切正常，跳过通知")
 
 
 if __name__ == "__main__":

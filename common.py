@@ -330,3 +330,86 @@ def send_feishu_card(webhook_url, card_payload, fallback_text=""):
                     logging.info("Feishu fallback text sent")
     except Exception as e:
         logging.error(f"Feishu send failed: {e}")
+
+
+# =============================================================================
+# 状态快照 — 灾难恢复，防止自愈/缓存故障吞掉售罄和补货事件
+# =============================================================================
+def save_state_snapshot(snapshot_data, filepath):
+    """保存状态快照到 JSON 文件，用于灾难恢复"""
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(snapshot_data, f, ensure_ascii=False)
+    logging.info(f"State snapshot saved: {len(snapshot_data)} products")
+
+
+def build_snapshot_from_db(conn):
+    """从 Jump Shop DB 构建状态快照 dict"""
+    rows = conn.execute(
+        "SELECT id, title, available, price, image_url, url, vendor, handle FROM products"
+    ).fetchall()
+    snapshot = {}
+    for row in rows:
+        pid, title, available, price, image_url, url, vendor, handle = row
+        snapshot[str(pid)] = {
+            "title": title,
+            "available": available,
+            "price": price,
+            "image_url": image_url,
+            "url": url,
+            "vendor": vendor,
+            "handle": handle,
+        }
+    return snapshot
+
+
+def load_state_snapshot(filepath):
+    """加载状态快照"""
+    if not Path(filepath).exists():
+        return {}
+    with open(filepath, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def detect_changes_from_snapshot(old_snapshot, products, cfg):
+    """对比旧快照与当前API数据，检测遗漏的售罄/补货/上新/价格变更"""
+    monitor_opts = cfg.get("monitor_options", {})
+    changes = []
+    product_map = {str(p["id"]): p for p in products}
+    old_ids = set(old_snapshot.keys())
+    current_ids = {str(p["id"]) for p in products}
+
+    for pid_str in old_ids & current_ids:
+        old = old_snapshot[pid_str]
+        p = product_map[pid_str]
+
+        if monitor_opts.get("detect_restocks", True) and old["available"] == 0 and p["available"] == 1:
+            changes.append({
+                "product_id": int(pid_str), "change_type": "restock",
+                "old_value": "out of stock", "new_value": "in stock (recovered)",
+                "product": p,
+            })
+        if monitor_opts.get("detect_sold_out", True) and old["available"] == 1 and p["available"] == 0:
+            changes.append({
+                "product_id": int(pid_str), "change_type": "sold_out",
+                "old_value": "in stock", "new_value": "sold out (recovered)",
+                "product": p,
+            })
+        if monitor_opts.get("detect_price_changes", True) and old["price"] != p["price"] and old["price"] != 0:
+            changes.append({
+                "product_id": int(pid_str), "change_type": "price_change",
+                "old_value": f"Y{old['price']}", "new_value": f"Y{p['price']}",
+                "product": p,
+            })
+
+    if monitor_opts.get("detect_new_products", True):
+        for pid_str in current_ids - old_ids:
+            p = product_map[pid_str]
+            changes.append({
+                "product_id": int(pid_str), "change_type": "new",
+                "old_value": None,
+                "new_value": f"{p['title']} | Y{p['price']} | {'in stock' if p['available'] else 'out of stock'}",
+                "product": p,
+            })
+
+    return changes

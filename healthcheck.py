@@ -240,7 +240,10 @@ def run_full_check(cfg):
     logging.info(f"自检结论: {status}")
     logging.info(details_str)
 
-    send_health_report(cfg, status, details_str)
+    if status in ("warn", "fail"):
+        send_health_report(cfg, status, details_str)
+    else:
+        logging.info("自检一切正常，跳过通知")
 
     return status
 
