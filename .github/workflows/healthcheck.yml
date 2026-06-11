@@ -38,7 +38,9 @@ jobs:
         uses: actions/cache/restore@v4
         id: cache-db
         with:
-          path: data/products.db
+          path: |
+            data/products.db
+            data/state_snapshot.json
           key: jumpshop-db-v2-${{ github.run_id }}
           restore-keys: |
             jumpshop-db-v2-
@@ -58,7 +60,7 @@ jobs:
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
         run: |
-          # 如果数据库坏了，强制重建
+          # 如果数据库坏了，尝试用快照恢复
           python -c "
           import sqlite3, sys
           from pathlib import Path
@@ -77,11 +79,46 @@ jobs:
           else:
               print('DB not found')
           sys.exit(1)
-          " || python healthcheck.py --rebuild
+          " || (
+            echo "DB broken, rebuilding with snapshot recovery..."
+            # 1. 从旧DB尝试导出快照(兜底)
+            python -c "
+            import json, sqlite3
+            from pathlib import Path
+            db = Path('data/products.db')
+            if db.exists():
+                try:
+                    conn = sqlite3.connect(str(db))
+                    rows = conn.execute('SELECT id, title, available, price, image_url, url, vendor, handle FROM products').fetchall()
+                    snap = {}
+                    for r in rows:
+                        snap[str(r[0])] = {'title':r[1], 'available':r[2], 'price':r[3], 'image_url':r[4], 'url':r[5], 'vendor':r[6], 'handle':r[7]}
+                    conn.close()
+                    with open('data/state_snapshot_preheal.json', 'w', encoding='utf-8') as f:
+                        json.dump(snap, f, ensure_ascii=False)
+                    print(f'Pre-heal snapshot: {len(snap)} products')
+                except Exception as e:
+                    print(f'Snapshot failed: {e}')
+            "
+            # 2. 删库重建
+            rm -f data/products.db data/products.db-wal data/products.db-shm
+            # 3. 确定用哪个快照
+            if [ -f data/state_snapshot_preheal.json ]; then SNAP=data/state_snapshot_preheal.json
+            elif [ -f data/state_snapshot.json ]; then SNAP=data/state_snapshot.json
+            else SNAP=""; fi
+            # 4. 重建基线(含快照恢复)
+            if [ -n "$SNAP" ]; then
+              python healthcheck.py --rebuild --recover-from="$SNAP"
+            else
+              python healthcheck.py --rebuild
+            fi
+          )
 
       - name: Save DB to cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: data/products.db
+          path: |
+            data/products.db
+            data/state_snapshot.json
           key: jumpshop-db-v2-${{ github.run_id }}

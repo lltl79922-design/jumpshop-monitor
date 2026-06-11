@@ -36,7 +36,9 @@ jobs:
         uses: actions/cache/restore@v4
         id: cache-db
         with:
-          path: data/ufotable.db
+          path: |
+            data/ufotable.db
+            data/ufotable_state_snapshot.json
           key: ufotable-db-v1-${{ github.run_id }}
           restore-keys: |
             ufotable-db-v1-
@@ -72,11 +74,46 @@ jobs:
           else:
               print('DB not found')
           sys.exit(1)
-          " || python ufotable_monitor.py --once --silent
+          " || (
+            echo "DB broken, rebuilding with snapshot recovery..."
+            # 1. 从旧DB尝试导出快照(兜底)
+            python -c "
+            import json, sqlite3
+            from pathlib import Path
+            db = Path('data/ufotable.db')
+            if db.exists():
+                try:
+                    conn = sqlite3.connect(str(db))
+                    rows = conn.execute('SELECT id, title, available, price, image_url, url, works FROM products').fetchall()
+                    snap = {}
+                    for r in rows:
+                        snap[str(r[0])] = {'title':r[1], 'available':r[2], 'price':r[3], 'image_url':r[4], 'url':r[5], 'vendor':r[6], 'handle':''}
+                    conn.close()
+                    with open('data/ufotable_state_snapshot_preheal.json', 'w', encoding='utf-8') as f:
+                        json.dump(snap, f, ensure_ascii=False)
+                    print(f'Pre-heal snapshot: {len(snap)} products')
+                except Exception as e:
+                    print(f'Snapshot failed: {e}')
+            "
+            # 2. 删库重建
+            rm -f data/ufotable.db data/ufotable.db-wal data/ufotable.db-shm
+            # 3. 确定用哪个快照
+            if [ -f data/ufotable_state_snapshot_preheal.json ]; then SNAP=data/ufotable_state_snapshot_preheal.json
+            elif [ -f data/ufotable_state_snapshot.json ]; then SNAP=data/ufotable_state_snapshot.json
+            else SNAP=""; fi
+            # 4. 重建基线(含快照恢复)
+            if [ -n "$SNAP" ]; then
+              python ufotable_monitor.py --once --recover-from="$SNAP"
+            else
+              python ufotable_monitor.py --once --silent
+            fi
+          )
 
       - name: Save DB to cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: data/ufotable.db
+          path: |
+            data/ufotable.db
+            data/ufotable_state_snapshot.json
           key: ufotable-db-v1-${{ github.run_id }}

@@ -255,10 +255,15 @@ def main():
     if "--rebuild" in sys.argv:
         db_path = cfg.get("database_path", "data/products.db")
         repair_database(db_path)
+        # 支持快照恢复
+        recover_from = None
+        for arg in sys.argv:
+            if arg.startswith("--recover-from="):
+                recover_from = arg.split("=", 1)[1]
         logging.info("Database rebuild complete. Running full scan...")
         import monitor_loop
         conn = monitor_loop.init_db(db_path)
-        monitor_loop.run_once(cfg, conn, is_first_run=True, silent=True)
+        monitor_loop.run_once(cfg, conn, is_first_run=True, silent=(recover_from is None), recover_from=recover_from)
         conn.close()
         logging.info("Rebuild + full scan complete")
         return
