@@ -26,7 +26,9 @@ from common import (
     JST, CHANGE_LABELS,
     setup_logging, log_changes,
     ensure_image_keys,
-    detect_soldout_delta, build_feishu_card, send_feishu_card,
+    detect_soldout_delta, detect_lightning_sellouts,
+    build_feishu_card, send_feishu_card,
+    maybe_send_bot_alert,
     save_state_snapshot, build_snapshot_from_db,
     load_state_snapshot, detect_changes_from_snapshot,
 )
@@ -78,6 +80,10 @@ def init_db(db_path):
         conn.execute("SELECT feishu_img_key FROM products LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE products ADD COLUMN feishu_img_key TEXT DEFAULT ''")
+    try:
+        conn.execute("SELECT last_available_at FROM products LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE products ADD COLUMN last_available_at TEXT DEFAULT ''")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS change_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,17 +215,21 @@ def detect_changes(conn, products, cfg):
 def update_db(conn, products, now_str):
     for p in products:
         conn.execute("""
-            INSERT INTO products (id, title, handle, vendor, tags, price, available, sku, image_url, url, published_at, updated_at, first_seen, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO products (id, title, handle, vendor, tags, price, available, sku, image_url, url, published_at, updated_at, first_seen, last_checked, last_available_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, handle=excluded.handle, vendor=excluded.vendor,
                 tags=excluded.tags, price=excluded.price, available=excluded.available,
                 sku=excluded.sku, image_url=excluded.image_url, url=excluded.url,
                 published_at=excluded.published_at, updated_at=excluded.updated_at,
-                last_checked=excluded.last_checked
+                last_checked=excluded.last_checked,
+                last_available_at=CASE
+                    WHEN excluded.available = 1 THEN excluded.last_checked
+                    ELSE products.last_available_at
+                END
         """, (p["id"], p["title"], p["handle"], p["vendor"], p["tags"],
               p["price"], p["available"], p["sku"], p["image_url"], p["url"],
-              p["published_at"], p["updated_at"], now_str, now_str))
+              p["published_at"], p["updated_at"], now_str, now_str, now_str))
     conn.commit()
 
 # ---------------------------------------------------------------------------
@@ -316,6 +326,15 @@ def send_notifications(cfg, conn, changes, now_str):
             ensure_image_keys(conn, changes, feishu_cfg)
         send_feishu(feishu_cfg, changes, now_str)
 
+        # Bot 扫货预警: 闪电售罄数量达到阈值时发送独立红色报警卡片
+        mo = cfg.get("monitor_options", {})
+        if mo.get("bot_alert_enabled", True):
+            bot_min = mo.get("bot_alert_min_count", 3)
+            maybe_send_bot_alert(
+                feishu_cfg["webhook_url"], changes, now_str,
+                JUMP_SHOP_CARD, min_count=bot_min
+            )
+
     if nc.get("wechat_work", {}).get("enabled"):
         send_wechat_work(nc["wechat_work"]["webhook_url"], changes, now_str)
     if nc.get("email", {}).get("enabled"):
@@ -360,12 +379,19 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         if rc["product_id"] not in existing_ids:
             changes.append(rc)
 
+    # 闪电售罄检测: 分析售罄商品的实际耗时
+    lightning_threshold = cfg["monitor_options"].get("lightning_sellout_threshold_seconds", 300)
+    detect_lightning_sellouts(conn, changes, now_str, lightning_threshold, publish_field="published_at")
+
     # 通知策略: 恢复模式下仅发送从快照恢复的变更，避免"全量上新"轰炸
     if changes:
         logging.info(f"Detected {len(changes)} changes")
         for c in changes[:10]:
             p = c["product"]
-            logging.info(f"  {CHANGE_LABELS[c['change_type']]} {p['title'][:60]} | Y{p['price']}")
+            label = CHANGE_LABELS[c['change_type']]
+            if c.get("lightning"):
+                label += " ⚡"
+            logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
         if len(changes) > 10:
             logging.info(f"  ... and {len(changes)-10} more")
 

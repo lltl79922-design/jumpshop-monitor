@@ -14,7 +14,10 @@
         "detect_restocks": true,
         "detect_sold_out": true,
         "detect_price_changes": true,
-        "notify_on_first_run": false
+        "notify_on_first_run": false,
+        "lightning_sellout_threshold_seconds": 300,
+        "bot_alert_min_count": 3,
+        "bot_alert_enabled": true
     },
     "database_path": "data/ufotable.db",
     "log_file": "data/ufotable_monitor.log"

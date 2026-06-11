@@ -109,7 +109,8 @@ def repair_database(db_path):
                 image_url TEXT, url TEXT,
                 published_at TEXT, updated_at TEXT,
                 first_seen TEXT, last_checked TEXT,
-                feishu_img_key TEXT DEFAULT ''
+                feishu_img_key TEXT DEFAULT '',
+                last_available_at TEXT DEFAULT ''
             )
         """)
         conn.execute("""

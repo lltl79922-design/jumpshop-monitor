@@ -18,6 +18,65 @@ CHANGE_LABELS = {
     "price_change": "[PRICE]",
 }
 
+
+# =============================================================================
+# 时间解析 — 支持多种时间戳格式
+# =============================================================================
+def parse_timestamp(ts):
+    """解析各种时间戳格式为 timezone-aware datetime。
+    支持: ISO 8601 ('2024-01-15T14:32:15+09:00'),
+          JST 标签 ('2026-06-11 14:35:00 JST'),
+          纯 datetime ('2024-01-15 14:32:15'),
+          纯日期 ('2024-01-15')
+    返回 None 如果解析失败。
+    """
+    if not ts or not isinstance(ts, str) or not ts.strip():
+        return None
+    ts = ts.strip()
+    try:
+        # ISO 8601 检测: 日期与时间之间有 'T' 分隔符 (e.g. "2024-01-15T14:32:15+09:00")
+        # 不能只用 'T' in ts，因为 "JST" 中也有 T
+        is_iso = ('T' in ts and ts.index('T') >= 8)  # T 出现在日期部分之后
+        if is_iso:
+            try:
+                return datetime.fromisoformat(ts)
+            except (ValueError, TypeError):
+                pass  # 可能不是标准 ISO，继续尝试其他格式
+        # JST 标签格式: "2026-06-11 14:35:00 JST"
+        if 'JST' in ts:
+            return datetime.strptime(ts.replace(' JST', ''), "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+        # 标准 datetime: "2024-01-15 14:32:15"
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        pass
+    try:
+        # 纯日期: "2024-01-15"
+        return datetime.strptime(ts, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def format_duration(seconds):
+    """格式化秒数为人类可读的时长字符串"""
+    if seconds is None:
+        return "时间未知"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"约{seconds}秒内"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        secs = seconds % 60
+        if secs == 0:
+            return f"约{minutes}分内"
+        return f"约{minutes}分{secs}秒内"
+    else:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        if minutes == 0:
+            return f"约{hours}小时内"
+        return f"约{hours}小时{minutes}分内"
+
 # =============================================================================
 # 日志
 # =============================================================================
@@ -155,9 +214,153 @@ def detect_soldout_delta(conn, products, detect_sold_out_enabled, now_str):
 
     return changes
 
+
 # =============================================================================
-# 变更日志
+# 闪电售罄检测 — 精确到秒的售罄速度分析
 # =============================================================================
+def detect_lightning_sellouts(conn, changes, now_str, threshold_seconds=300, publish_field="published_at"):
+    """分析售罄商品的实际售罄速度，标记闪电售罄。
+
+    时间源优先级（取最早可用的"有货时间"）:
+      1. last_available_at — 上次检测时还有货 (最准确)
+      2. {publish_field} — 商品上架/发布时间 (秒级精度)
+      3. first_seen — 首次被监控发现的时间 (兜底)
+
+    将闪电信息写入 change dict: c["lightning"] = {sellout_seconds, source, display}
+    """
+    if threshold_seconds <= 0:
+        return
+
+    now_dt = parse_timestamp(now_str)
+    if not now_dt:
+        logging.warning("Cannot parse now_str for lightning detection: %s", now_str)
+        return
+
+    lightning_count = 0
+
+    for c in changes:
+        if c["change_type"] != "sold_out":
+            continue
+
+        pid = c["product_id"]
+        row = conn.execute(
+            f"SELECT last_available_at, {publish_field}, first_seen FROM products WHERE id=?",
+            (pid,)
+        ).fetchone()
+
+        if not row:
+            continue
+
+        last_avail, pub_ts, first_seen = row
+
+        # 按优先级尝试各时间源
+        sellout_seconds = None
+        source = None
+
+        for src_label, ts_val in [
+            ("last_available", last_avail),
+            ("published", pub_ts),
+            ("first_seen", first_seen),
+        ]:
+            ref_dt = parse_timestamp(ts_val) if ts_val else None
+            if ref_dt:
+                delta = (now_dt - ref_dt).total_seconds()
+                if delta >= 0:
+                    sellout_seconds = delta
+                    source = src_label
+                    break
+
+        if sellout_seconds is not None and sellout_seconds <= threshold_seconds:
+            c["lightning"] = {
+                "sellout_seconds": int(sellout_seconds),
+                "source": source,
+                "display": format_duration(int(sellout_seconds)),
+            }
+            lightning_count += 1
+            logging.info(
+                "  ⚡ Lightning sellout: %s | %s | source=%s",
+                c["product"].get("title", str(pid))[:50],
+                format_duration(int(sellout_seconds)),
+                source
+            )
+
+    if lightning_count:
+        logging.info("Lightning sellout summary: %d/%d sold_out items", lightning_count,
+                     sum(1 for c in changes if c["change_type"] == "sold_out"))
+
+
+# =============================================================================
+# Bot 扫货预警
+# =============================================================================
+def build_bot_alert_card(lightning_items, now_str, shop_config):
+    """构建 Bot 扫货预警的独立飞书卡片 (红色警告)"""
+    header_title = f"  {shop_config['name']} Bot 掃貨警報"
+
+    elements = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"  本次检测发现 **{len(lightning_items)} 件**商品在极短时间内售罄，\n  疑似自动化扫货程序活动。"
+            }
+        },
+        {"tag": "hr"},
+    ]
+
+    for c in lightning_items[:20]:
+        p = c["product"]
+        linfo = c.get("lightning", {})
+        duration = linfo.get("display", "极短时间")
+        price_yen = f"  {p['price']:,}"
+        subtitle_field = shop_config.get("subtitle_field", "vendor")
+        subtitle = p.get(subtitle_field, "")
+
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**{p['title']}**\n{price_yen} | {subtitle} |   售罄耗时: **{duration}**\n[商品ページ]({p['url']})"
+            }
+        })
+
+    if len(lightning_items) > 20:
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"  他 {len(lightning_items) - 20} 件省略"}
+        })
+
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [{"tag": "plain_text", "content": f"  {now_str}  |  {shop_config['footer']} 自動警報"}]
+    })
+
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": header_title},
+                "template": "red"
+            },
+            "elements": elements
+        }
+    }
+
+
+def maybe_send_bot_alert(webhook_url, changes, now_str, shop_config, min_count=3):
+    """如果闪电售罄数量达到阈值，发送独立的 Bot 扫货预警卡片"""
+    if not webhook_url or min_count <= 0:
+        return
+
+    lightning_items = [c for c in changes if c.get("lightning")]
+    if len(lightning_items) < min_count:
+        return
+
+    logging.info("Bot alert triggered: %d lightning sellouts >= threshold %d",
+                 len(lightning_items), min_count)
+    card = build_bot_alert_card(lightning_items, now_str, shop_config)
+    send_feishu_card(webhook_url, card)
 def log_changes(conn, changes, now_str):
     for c in changes:
         conn.execute(
@@ -179,15 +382,24 @@ def build_feishu_card(changes, now_str, shop_config):
     total = len(changes)
     new_count = sum(1 for c in changes if c["change_type"] == "new")
     restock_count = sum(1 for c in changes if c["change_type"] == "restock")
-    soldout_count = sum(1 for c in changes if c["change_type"] == "sold_out")
+    lightning_count = sum(1 for c in changes if c["change_type"] == "sold_out" and c.get("lightning"))
+    normal_soldout_count = sum(1 for c in changes if c["change_type"] == "sold_out" and not c.get("lightning"))
+    soldout_count = lightning_count + normal_soldout_count
     price_count = sum(1 for c in changes if c["change_type"] == "price_change")
 
     parts = []
     if new_count: parts.append(f"上新 {new_count}")
     if restock_count: parts.append(f"補貨 {restock_count}")
-    if soldout_count: parts.append(f"售罄 {soldout_count}")
+    if lightning_count: parts.append(f"  閃電售罄 {lightning_count}")
+    if normal_soldout_count: parts.append(f"售罄 {normal_soldout_count}")
+    elif soldout_count and not lightning_count: parts.append(f"售罄 {soldout_count}")
     if price_count: parts.append(f"価格変更 {price_count}")
     summary = "  |  ".join(parts) if parts else "  状態変更なし"
+
+    # 若有闪电售罄，头部用红色警告标题
+    header_title = f"  {shop_config['name']} 商品監視"
+    if lightning_count:
+        header_title = f"    {shop_config['name']} 商品監視"
 
     elements = [
         {
@@ -200,19 +412,88 @@ def build_feishu_card(changes, now_str, shop_config):
         {"tag": "hr"}
     ]
 
-    type_order = [
-        ("new", "  新商品上架"),
-        ("restock", "  補貨"),
-        ("sold_out", "  售罄"),
-        ("price_change", "  価格変更"),
-    ]
-
     max_items = 50
     shown = 0
     subtitle_field = shop_config.get("subtitle_field", "vendor")
 
-    for ctype, header in type_order:
-        items = [c for c in changes if c["change_type"] == ctype]
+    def render_product_item(c, extra_info=""):
+        """渲染单个商品条目 (图片+信息+按钮)"""
+        p = c["product"]
+        status_icon = "  " if p["available"] else "  "
+        status_text = "在庫あり" if p["available"] else "在庫なし"
+        price_yen = f"  {p['price']:,}"
+        subtitle = p.get(subtitle_field, "")
+        img_key = p.get("feishu_img_key", "")
+
+        product_md = f"**{p['title']}**\n{price_yen} | {subtitle} | {status_icon} {status_text}"
+        if extra_info:
+            product_md += f"\n{extra_info}"
+        ctype = c.get("change_type", "")
+        if ctype == "price_change":
+            product_md += f"\n{c['old_value']}    {c['new_value']}"
+
+        if img_key:
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "bisect",
+                "background_style": "default",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 2,
+                        "elements": [{
+                            "tag": "img",
+                            "img_key": img_key,
+                            "alt": {"tag": "plain_text", "content": ""},
+                            "preview": True,
+                            "mode": "fit_horizontal"
+                        }]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 3,
+                        "elements": [{
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": product_md}
+                        }]
+                    }
+                ]
+            })
+        else:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": product_md}
+            })
+
+        elements.append({
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "  商品ページ"},
+                "type": "default",
+                "url": p["url"]
+            }]
+        })
+
+    # 渲染顺序: 上新 → 補貨 → 闪电售罄 → 普通售罄 → 価格変更
+    section_order = [
+        ("new", "  新商品上架", False),
+        ("restock", "  補貨", False),
+        ("sold_out", "   閃電售罄", True),   # lightning=True → 仅闪电
+        ("sold_out", "  售罄", False),       # lightning=False → 仅非闪电
+    ]
+
+    for ctype, header, want_lightning in section_order:
+        if ctype == "sold_out":
+            if want_lightning:
+                items = [c for c in changes if c["change_type"] == "sold_out" and c.get("lightning")]
+            else:
+                items = [c for c in changes if c["change_type"] == "sold_out" and not c.get("lightning")]
+        else:
+            items = [c for c in changes if c["change_type"] == ctype]
+
         if not items:
             continue
 
@@ -225,68 +506,34 @@ def build_feishu_card(changes, now_str, shop_config):
             if shown >= max_items:
                 break
 
-            p = c["product"]
-            status_icon = "  " if p["available"] else "  "
-            status_text = "在庫あり" if p["available"] else "在庫なし"
-            price_yen = f"  {p['price']:,}"
-            subtitle = p.get(subtitle_field, "")
-            img_key = p.get("feishu_img_key", "")
+            extra = ""
+            if c.get("lightning"):
+                linfo = c["lightning"]
+                source_note = {
+                    "last_available": "前回検出時",
+                    "published": "上架後",
+                    "first_seen": "初回発見時",
+                }.get(linfo.get("source", ""), "")
+                extra = f"    {source_note}{linfo.get('display', '')}に完売"
 
-            product_md = f"**{p['title']}**\n{price_yen} | {subtitle} | {status_icon} {status_text}"
-            if ctype == "price_change":
-                product_md += f"\n{c['old_value']}    {c['new_value']}"
-
-            # 有图片: 左右分栏布局 (图片 | 信息)
-            if img_key:
-                elements.append({
-                    "tag": "column_set",
-                    "flex_mode": "bisect",
-                    "background_style": "default",
-                    "columns": [
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 2,
-                            "elements": [{
-                                "tag": "img",
-                                "img_key": img_key,
-                                "alt": {"tag": "plain_text", "content": ""},
-                                "preview": True,
-                                "mode": "fit_horizontal"
-                            }]
-                        },
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 3,
-                            "elements": [{
-                                "tag": "div",
-                                "text": {"tag": "lark_md", "content": product_md}
-                            }]
-                        }
-                    ]
-                })
-            else:
-                elements.append({
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": product_md}
-                })
-
-            # 按钮
-            elements.append({
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "  商品ページ"},
-                    "type": "default",
-                    "url": p["url"]
-                }]
-            })
-
+            render_product_item(c, extra)
             shown += 1
 
         if shown >= max_items:
             break
+
+    # 価格変更单独处理
+    price_items = [c for c in changes if c["change_type"] == "price_change"]
+    if price_items and shown < max_items:
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"**  価格変更 ({len(price_items)}件)**"}
+        })
+        for c in price_items:
+            if shown >= max_items:
+                break
+            render_product_item(c)
+            shown += 1
 
     if total > max_items:
         over = total - max_items
@@ -304,7 +551,7 @@ def build_feishu_card(changes, now_str, shop_config):
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
-            "title": {"tag": "plain_text", "content": f"  {shop_config['name']} 商品監視"},
+            "title": {"tag": "plain_text", "content": header_title},
             "template": shop_config["template_color"]
         },
         "elements": elements

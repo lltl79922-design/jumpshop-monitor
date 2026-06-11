@@ -64,7 +64,8 @@ def init_db(db_path):
             published_at TEXT,
             updated_at TEXT,
             first_seen TEXT,
-            last_checked TEXT
+            last_checked TEXT,
+            last_available_at TEXT DEFAULT ''
         )
     """)
     conn.execute("""

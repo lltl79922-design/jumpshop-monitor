@@ -22,7 +22,9 @@ from common import (
     JST, CHANGE_LABELS,
     setup_logging, log_changes,
     ensure_image_keys,
-    detect_soldout_delta, build_feishu_card, send_feishu_card,
+    detect_soldout_delta, detect_lightning_sellouts,
+    build_feishu_card, send_feishu_card,
+    maybe_send_bot_alert,
     save_state_snapshot, load_state_snapshot, detect_changes_from_snapshot,
 )
 
@@ -83,6 +85,10 @@ def init_db(db_path):
         conn.execute("SELECT feishu_img_key FROM products LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE products ADD COLUMN feishu_img_key TEXT DEFAULT ''")
+    try:
+        conn.execute("SELECT last_available_at FROM products LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE products ADD COLUMN last_available_at TEXT DEFAULT ''")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS change_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,17 +220,21 @@ def detect_changes(conn, products, cfg):
 def update_db(conn, products, now_str):
     for p in products:
         conn.execute("""
-            INSERT INTO products (id, product_code, title, works, category, price, available, image_url, url, valid_after, first_seen, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO products (id, product_code, title, works, category, price, available, image_url, url, valid_after, first_seen, last_checked, last_available_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 product_code=excluded.product_code, title=excluded.title,
                 works=excluded.works, category=excluded.category,
                 price=excluded.price, available=excluded.available,
                 image_url=excluded.image_url, url=excluded.url,
-                valid_after=excluded.valid_after, last_checked=excluded.last_checked
+                valid_after=excluded.valid_after, last_checked=excluded.last_checked,
+                last_available_at=CASE
+                    WHEN excluded.available = 1 THEN excluded.last_checked
+                    ELSE products.last_available_at
+                END
         """, (p["id"], p["product_code"], p["title"], p["works"], p["category"],
               p["price"], p["available"], p["image_url"], p["url"],
-              p["valid_after"], now_str, now_str))
+              p["valid_after"], now_str, now_str, now_str))
     conn.commit()
 
 
@@ -244,6 +254,15 @@ def send_notifications(cfg, conn, changes, now_str):
         if feishu_cfg.get("image_preview") and feishu_cfg.get("app_id"):
             ensure_image_keys(conn, changes, feishu_cfg)
         send_feishu(feishu_cfg, changes, now_str)
+
+        # Bot 扫货预警
+        mo = cfg.get("monitor_options", {})
+        if mo.get("bot_alert_enabled", True):
+            bot_min = mo.get("bot_alert_min_count", 3)
+            maybe_send_bot_alert(
+                feishu_cfg["webhook_url"], changes, now_str,
+                UFOTABLE_CARD, min_count=bot_min
+            )
 
 
 def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
@@ -282,12 +301,19 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         if rc["product_id"] not in existing_ids:
             changes.append(rc)
 
+    # 闪电售罄检测: 分析售罄商品的实际耗时 (ufotable 用 valid_after 作为上架时间)
+    lightning_threshold = cfg.get("monitor_options", {}).get("lightning_sellout_threshold_seconds", 300)
+    detect_lightning_sellouts(conn, changes, now_str, lightning_threshold, publish_field="valid_after")
+
     # 通知策略: 恢复模式下仅发送从快照恢复的变更
     if changes:
         logging.info(f"Detected {len(changes)} changes")
         for c in changes[:10]:
             p = c["product"]
-            logging.info(f"  {CHANGE_LABELS[c['change_type']]} {p['title'][:60]} | Y{p['price']}")
+            label = CHANGE_LABELS[c['change_type']]
+            if c.get("lightning"):
+                label += " ⚡"
+            logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
         if len(changes) > 10:
             logging.info(f"  ... and {len(changes)-10} more")
 
