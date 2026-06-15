@@ -39,8 +39,9 @@ jobs:
           path: |
             data/ufotable.db
             data/ufotable_state_snapshot.json
-          key: ufotable-db-v1-${{ github.run_id }}
+          key: ufotable-db-v2-${{ github.run_id }}
           restore-keys: |
+            ufotable-db-v2-
             ufotable-db-v1-
 
       - name: Run Healthcheck
@@ -116,4 +117,4 @@ jobs:
           path: |
             data/ufotable.db
             data/ufotable_state_snapshot.json
-          key: ufotable-db-v1-${{ github.run_id }}
+          key: ufotable-db-v2-${{ github.run_id }}

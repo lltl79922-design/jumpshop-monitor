@@ -41,8 +41,9 @@ jobs:
           path: |
             data/products.db
             data/state_snapshot.json
-          key: jumpshop-db-v2-${{ github.run_id }}
+          key: jumpshop-db-v3-${{ github.run_id }}
           restore-keys: |
+            jumpshop-db-v3-
             jumpshop-db-v2-
 
       - name: Run Healthcheck
@@ -121,4 +122,4 @@ jobs:
           path: |
             data/products.db
             data/state_snapshot.json
-          key: jumpshop-db-v2-${{ github.run_id }}
+          key: jumpshop-db-v3-${{ github.run_id }}
