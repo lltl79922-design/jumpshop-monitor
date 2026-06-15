@@ -8,13 +8,14 @@ on:
       - 'ufotable_config.example.json'
       - '.github/workflows/ufotable-monitor.yml'
   schedule:
-    - cron: '* * * * *'
+    # 每6小时触发新job作为安全网 (自循环job最长跑350分钟)
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 360  # 6小时
 
     steps:
       - uses: actions/checkout@v4
@@ -33,8 +34,9 @@ jobs:
           path: |
             data/ufotable.db
             data/ufotable_state_snapshot.json
-          key: ufotable-db-v1-${{ github.run_id }}
+          key: ufotable-db-v2-${{ github.run_id }}
           restore-keys: |
+            ufotable-db-v2-
             ufotable-db-v1-
 
       - name: Repair DB (clean stale WAL)
@@ -54,71 +56,98 @@ jobs:
       - name: Setup config
         run: cp ufotable_config.example.json ufotable_config.json
 
-      - name: Run monitor
-        id: monitor
-        continue-on-error: true
-        env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-        run: python ufotable_monitor.py --once
-
-      - name: Self-heal on failure
-        if: steps.monitor.outcome == 'failure'
+      - name: Monitor self-loop (~1 min interval, max 350 min)
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
         run: |
-          echo "Monitor failed, self-healing..."
-          # 1. 删库前从旧DB导出状态快照
-          python -c "
-          import json, sqlite3
-          from pathlib import Path
-          db = Path('data/ufotable.db')
-          if db.exists():
-              try:
-                  conn = sqlite3.connect(str(db))
-                  rows = conn.execute('SELECT id, title, available, price, image_url, url, works FROM products').fetchall()
-                  snap = {}
-                  for r in rows:
-                      snap[str(r[0])] = {'title':r[1], 'available':r[2], 'price':r[3], 'image_url':r[4], 'url':r[5], 'vendor':r[6], 'handle':''}
-                  conn.close()
-                  Path('data').mkdir(parents=True, exist_ok=True)
-                  with open('data/ufotable_state_snapshot_preheal.json', 'w', encoding='utf-8') as f:
-                      json.dump(snap, f, ensure_ascii=False)
-                  print(f'Pre-heal snapshot saved: {len(snap)} products')
-              except Exception as e:
-                  print(f'Could not save pre-heal snapshot: {e}')
-          else:
-              print('No old DB to snapshot')
-          "
-          # 2. 删除损坏的数据库
-          rm -f data/ufotable.db data/ufotable.db-wal data/ufotable.db-shm
-          # 3. 重建空库
-          python -c "
-          import sqlite3
-          conn = sqlite3.connect('data/ufotable.db')
-          conn.execute('PRAGMA journal_mode=WAL')
-          conn.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, product_code TEXT, title TEXT, works TEXT, category TEXT, price INTEGER, available INTEGER, image_url TEXT, url TEXT, valid_after TEXT, first_seen TEXT, last_checked TEXT, feishu_img_key TEXT DEFAULT \"\", last_available_at TEXT DEFAULT \"\")')
-          conn.execute('CREATE TABLE IF NOT EXISTS change_log (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, change_type TEXT, old_value TEXT, new_value TEXT, detected_at TEXT, notified INTEGER DEFAULT 0)')
-          conn.execute('CREATE TABLE IF NOT EXISTS soldout_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), soldout_ids TEXT DEFAULT \"[]\", updated_at TEXT DEFAULT \"\")')
-          conn.execute('INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at) VALUES (1, \"[]\", \"\")')
-          conn.commit()
-          conn.close()
-          "
-          # 4. 用快照恢复遗漏事件
-          if [ -f data/ufotable_state_snapshot_preheal.json ]; then
-            echo "Recovering with pre-heal snapshot..."
-            python ufotable_monitor.py --once --recover-from=data/ufotable_state_snapshot_preheal.json
-          elif [ -f data/ufotable_state_snapshot.json ]; then
-            echo "Recovering with cached state snapshot..."
-            python ufotable_monitor.py --once --recover-from=data/ufotable_state_snapshot.json
-          else
-            echo "No snapshot available, fresh baseline..."
-            python ufotable_monitor.py --once --silent
-          fi
-          echo "Self-heal complete"
+          set +e
+          MAX_RUNTIME_MIN=350
+          START_TIME=$(date +%s)
+          ITERATION=0
+
+          while true; do
+            ITERATION=$((ITERATION + 1))
+            ITER_START=$(date +%s)
+            ELAPSED=$(( (ITER_START - START_TIME) / 60 ))
+
+            echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] Iteration $ITERATION (elapsed: ${ELAPSED}min / ${MAX_RUNTIME_MIN}min) ==="
+
+            # Run monitor
+            if python ufotable_monitor.py --once; then
+              echo "Monitor OK"
+            else
+              echo "Monitor FAILED, attempting self-heal..."
+              # 1. Save pre-heal snapshot
+              python -c "
+              import json, sqlite3
+              from pathlib import Path
+              db = Path('data/ufotable.db')
+              if db.exists():
+                  try:
+                      conn = sqlite3.connect(str(db))
+                      rows = conn.execute('SELECT id, title, available, price, image_url, url, works FROM products').fetchall()
+                      snap = {}
+                      for r in rows:
+                          snap[str(r[0])] = {'title':r[1], 'available':r[2], 'price':r[3], 'image_url':r[4], 'url':r[5], 'vendor':r[6], 'handle':''}
+                      conn.close()
+                      Path('data').mkdir(parents=True, exist_ok=True)
+                      with open('data/ufotable_state_snapshot_preheal.json', 'w', encoding='utf-8') as f:
+                          json.dump(snap, f, ensure_ascii=False)
+                      print(f'Pre-heal snapshot saved: {len(snap)} products')
+                  except Exception as e:
+                      print(f'Could not save pre-heal snapshot: {e}')
+              else:
+                  print('No old DB to snapshot')
+              "
+              # 2. Delete corrupted DB
+              rm -f data/ufotable.db data/ufotable.db-wal data/ufotable.db-shm
+              # 3. Rebuild empty DB
+              python -c "
+              import sqlite3
+              conn = sqlite3.connect('data/ufotable.db')
+              conn.execute('PRAGMA journal_mode=WAL')
+              conn.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, product_code TEXT, title TEXT, works TEXT, category TEXT, price INTEGER, available INTEGER, image_url TEXT, url TEXT, valid_after TEXT, first_seen TEXT, last_checked TEXT, feishu_img_key TEXT DEFAULT \"\", last_available_at TEXT DEFAULT \"\")')
+              conn.execute('CREATE TABLE IF NOT EXISTS change_log (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, change_type TEXT, old_value TEXT, new_value TEXT, detected_at TEXT, notified INTEGER DEFAULT 0)')
+              conn.execute('CREATE TABLE IF NOT EXISTS soldout_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), soldout_ids TEXT DEFAULT \"[]\", updated_at TEXT DEFAULT \"\")')
+              conn.execute('INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at) VALUES (1, \"[]\", \"\")')
+              conn.commit()
+              conn.close()
+              "
+              # 4. Recover with snapshot
+              if [ -f data/ufotable_state_snapshot_preheal.json ]; then
+                echo "Recovering with pre-heal snapshot..."
+                python ufotable_monitor.py --once --recover-from=data/ufotable_state_snapshot_preheal.json
+              elif [ -f data/ufotable_state_snapshot.json ]; then
+                echo "Recovering with cached state snapshot..."
+                python ufotable_monitor.py --once --recover-from=data/ufotable_state_snapshot.json
+              else
+                echo "No snapshot available, fresh baseline..."
+                python ufotable_monitor.py --once --silent
+              fi
+              echo "Self-heal complete"
+            fi
+
+            # Check time limit
+            NOW=$(date +%s)
+            ELAPSED=$(( (NOW - START_TIME) / 60 ))
+            if [ $ELAPSED -ge $MAX_RUNTIME_MIN ]; then
+              echo "Time limit reached (${ELAPSED}min >= ${MAX_RUNTIME_MIN}min), stopping loop"
+              break
+            fi
+
+            # Calculate sleep to maintain ~60s interval (min sleep 5s)
+            ITER_TOOK=$(( NOW - ITER_START ))
+            SLEEP_TIME=$(( 60 - ITER_TOOK ))
+            if [ $SLEEP_TIME -lt 5 ]; then
+              SLEEP_TIME=5
+            fi
+            echo "Iteration took ${ITER_TOOK}s, sleeping ${SLEEP_TIME}s..."
+            sleep $SLEEP_TIME
+          done
+
+          echo "Self-loop ended after $ITERATION iterations"
 
       - name: Checkpoint DB
         if: always()
@@ -140,4 +169,4 @@ jobs:
           path: |
             data/ufotable.db
             data/ufotable_state_snapshot.json
-          key: ufotable-db-v1-${{ github.run_id }}
+          key: ufotable-db-v2-${{ github.run_id }}
