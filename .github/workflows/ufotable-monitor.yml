@@ -12,6 +12,11 @@ on:
     - cron: '17 */6 * * *'
   workflow_dispatch:
 
+# 防止并发: 新触发自动取消旧job, 避免重复推送
+concurrency:
+  group: ufotable-monitor
+  cancel-in-progress: true
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
