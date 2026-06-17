@@ -371,10 +371,11 @@ def log_changes(conn, changes, now_str):
 # =============================================================================
 # 飞书交互式卡片
 # =============================================================================
-def build_feishu_cards(changes, now_str, shop_config, max_per_card=50):
+def build_feishu_cards(changes, now_str, shop_config, max_per_card=50, max_cards=10):
     """
     返回 list of card payloads — 当变更超过 max_per_card 件时自动分页。
     每张卡片独立发送，header 标注页码 (例: "1/3")。
+    超过 max_cards 张卡片时截断，末尾标注省略数量。
 
     shop_config 字段:
       - name: 商店显示名称
@@ -544,6 +545,16 @@ def build_feishu_cards(changes, now_str, shop_config, max_per_card=50):
     if total_pages == 0:
         return []
 
+    # 截断: 超过 max_cards 张时只保留前 N 张
+    truncated = False
+    if total_pages > max_cards:
+        cards = cards[:max_cards]
+        truncated = True
+
+    # 统计实际展示的 item 数
+    shown_total = sum(1 for page in cards for (_, _, items) in page for _ in items)
+    omitted = total - shown_total
+
     # 构建每张卡片
     result = []
     for page_idx, page_sections in enumerate(cards):
@@ -575,12 +586,20 @@ def build_feishu_cards(changes, now_str, shop_config, max_per_card=50):
                     extra = f"    {source_note}{linfo.get('display', '')}に完売"
                 render_product_item(elements, c, extra)
 
+        # 截断提示 (放在 footer 前)
+        if truncated and page_idx == len(cards) - 1 and omitted > 0:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"  ...他 {omitted} 件の変更は省略されました（表示上限 {max_cards * max_per_card} 件）"}
+            })
+
         elements.append({"tag": "hr"})
 
         # 页脚: 页码信息
+        shown_pages = max_cards if truncated else total_pages
         page_info = f"  {now_str}  |  {shop_config['footer']}"
-        if total_pages > 1:
-            page_info = f"  Page {page_idx+1}/{total_pages}  |  {now_str}  |  {shop_config['footer']}"
+        if shown_pages > 1:
+            page_info = f"  Page {page_idx+1}/{shown_pages}  |  {now_str}  |  {shop_config['footer']}"
 
         elements.append({
             "tag": "note",
@@ -589,8 +608,8 @@ def build_feishu_cards(changes, now_str, shop_config, max_per_card=50):
 
         # 标题 + 页码
         header_title = base_header_title
-        if total_pages > 1:
-            header_title = f"  {shop_config['name']} 商品監視 ({page_idx+1}/{total_pages})"
+        if shown_pages > 1:
+            header_title = f"  {shop_config['name']} 商品監視 ({page_idx+1}/{shown_pages})"
 
         card = {
             "config": {"wide_screen_mode": True},
