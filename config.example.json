@@ -35,7 +35,8 @@
         "notify_on_first_run": false,
         "lightning_sellout_threshold_seconds": 300,
         "bot_alert_min_count": 3,
-        "bot_alert_enabled": true
+        "bot_alert_enabled": true,
+        "new_product_fuse_threshold": 150
     },
     "database_path": "data/products.db",
     "log_file": "data/monitor.log"
