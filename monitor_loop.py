@@ -395,7 +395,32 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         if len(changes) > 10:
             logging.info(f"  ... and {len(changes)-10} more")
 
-        if silent:
+        # 熔断: 上新数超过阈值 → 判定为缓存异常，降级为纯文本摘要
+        new_count = sum(1 for c in changes if c["change_type"] == "new")
+        fuse_threshold = cfg["monitor_options"].get("new_product_fuse_threshold", 150)
+        if new_count > fuse_threshold:
+            logging.warning(
+                f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}. "
+                "Likely cache corruption — sending summary only."
+            )
+            # 只发一条文本摘要，不发卡片轰炸
+            if not silent and (not is_first_run or cfg["monitor_options"].get("notify_on_first_run")):
+                summary_text = (
+                    f"JUMP SHOP 異常検知\n\n"
+                    f"新商品数 {new_count} 件が閾値 {fuse_threshold} を超えました。\n"
+                    f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
+                    f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
+                    f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
+                    f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
+                    f"{now_str} | Jump Shop Monitor"
+                )
+                feishu_cfg = cfg["notifications"].get("feishu", {})
+                if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
+                    send_feishu_card(
+                        feishu_cfg["webhook_url"],
+                        {"msg_type": "text", "content": {"text": summary_text}},
+                    )
+        elif silent:
             logging.info("Silent mode - skipping notifications")
         elif is_first_run and recovered_changes and not cfg["monitor_options"].get("notify_on_first_run"):
             notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
