@@ -27,7 +27,7 @@ from common import (
     setup_logging, log_changes,
     ensure_image_keys,
     detect_soldout_delta, detect_lightning_sellouts,
-    build_feishu_card, send_feishu_card,
+    build_feishu_cards, send_feishu_card,
     maybe_send_bot_alert,
     save_state_snapshot, build_snapshot_from_db,
     load_state_snapshot, detect_changes_from_snapshot,
@@ -276,11 +276,11 @@ def format_text_message(changes, now_str):
 
 
 def send_feishu(feishu_cfg, changes, now_str):
-    """飞书交互式卡片通知(含图片预览)"""
+    """飞书交互式卡片通知(含图片预览), 超过50件自动分页"""
     webhook_url = feishu_cfg["webhook_url"]
-    payload = build_feishu_card(changes, now_str, JUMP_SHOP_CARD)
+    cards = build_feishu_cards(changes, now_str, JUMP_SHOP_CARD)
     fallback = "JUMP SHOP Monitor\n\n" + format_text_message(changes, now_str)[:8000]
-    send_feishu_card(webhook_url, payload, fallback)
+    send_feishu_card(webhook_url, cards, fallback)
 
 
 def send_wechat_work(webhook_url, changes, now_str):

@@ -23,7 +23,7 @@ from common import (
     setup_logging, log_changes,
     ensure_image_keys,
     detect_soldout_delta, detect_lightning_sellouts,
-    build_feishu_card, send_feishu_card,
+    build_feishu_cards, send_feishu_card,
     maybe_send_bot_alert,
     save_state_snapshot, load_state_snapshot, detect_changes_from_snapshot,
 )
@@ -239,10 +239,10 @@ def update_db(conn, products, now_str):
 
 
 def send_feishu(feishu_cfg, changes, now_str):
-    """飞书交互式卡片通知(蓝色模板)"""
+    """飞书交互式卡片通知(蓝色模板), 超过50件自动分页"""
     webhook_url = feishu_cfg["webhook_url"]
-    payload = build_feishu_card(changes, now_str, UFOTABLE_CARD)
-    send_feishu_card(webhook_url, payload)
+    cards = build_feishu_cards(changes, now_str, UFOTABLE_CARD)
+    send_feishu_card(webhook_url, cards)
 
 
 def send_notifications(cfg, conn, changes, now_str):

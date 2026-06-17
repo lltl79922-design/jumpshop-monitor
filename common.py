@@ -371,8 +371,11 @@ def log_changes(conn, changes, now_str):
 # =============================================================================
 # 飞书交互式卡片
 # =============================================================================
-def build_feishu_card(changes, now_str, shop_config):
+def build_feishu_cards(changes, now_str, shop_config, max_per_card=50):
     """
+    返回 list of card payloads — 当变更超过 max_per_card 件时自动分页。
+    每张卡片独立发送，header 标注页码 (例: "1/3")。
+
     shop_config 字段:
       - name: 商店显示名称
       - template_color: 卡片头部颜色 (red/blue)
@@ -380,6 +383,9 @@ def build_feishu_card(changes, now_str, shop_config):
       - subtitle_field: 商品副标题字段 ("vendor" 或 "works")
     """
     total = len(changes)
+    if total == 0:
+        return []
+
     new_count = sum(1 for c in changes if c["change_type"] == "new")
     restock_count = sum(1 for c in changes if c["change_type"] == "restock")
     lightning_count = sum(1 for c in changes if c["change_type"] == "sold_out" and c.get("lightning"))
@@ -390,34 +396,44 @@ def build_feishu_card(changes, now_str, shop_config):
     parts = []
     if new_count: parts.append(f"上新 {new_count}")
     if restock_count: parts.append(f"補貨 {restock_count}")
-    if lightning_count: parts.append(f"  閃電售罄 {lightning_count}")
+    if lightning_count: parts.append(f"⚡閃電售罄 {lightning_count}")
     if normal_soldout_count: parts.append(f"售罄 {normal_soldout_count}")
     elif soldout_count and not lightning_count: parts.append(f"售罄 {soldout_count}")
     if price_count: parts.append(f"価格変更 {price_count}")
     summary = "  |  ".join(parts) if parts else "  状態変更なし"
 
-    # 若有闪电售罄，头部用红色警告标题
-    header_title = f"  {shop_config['name']} 商品監視"
-    if lightning_count:
-        header_title = f"    {shop_config['name']} 商品監視"
+    base_header_title = f"  {shop_config['name']} 商品監視"
 
-    elements = [
-        {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": f"  {summary}"
-            }
-        },
-        {"tag": "hr"}
+    # 渲染顺序: 上新 → 補貨 → 闪电售罄 → 普通售罄 → 価格変更
+    section_order = [
+        ("new", "  新商品上架", False),
+        ("restock", "  補貨", False),
+        ("sold_out", "   閃電售罄", True),
+        ("sold_out", "  售罄", False),
     ]
 
-    max_items = 50
-    shown = 0
+    # 按优先级展开所有 items 为有序列表
     subtitle_field = shop_config.get("subtitle_field", "vendor")
+    ordered_items = []
 
-    def render_product_item(c, extra_info=""):
-        """渲染单个商品条目 (图片+信息+按钮)"""
+    for ctype, header, want_lightning in section_order:
+        if ctype == "sold_out":
+            if want_lightning:
+                items = [c for c in changes if c["change_type"] == "sold_out" and c.get("lightning")]
+            else:
+                items = [c for c in changes if c["change_type"] == "sold_out" and not c.get("lightning")]
+        else:
+            items = [c for c in changes if c["change_type"] == ctype]
+
+        if items:
+            ordered_items.append((ctype, header, items))
+
+    price_items = [c for c in changes if c["change_type"] == "price_change"]
+    if price_items:
+        ordered_items.append(("price_change", "  価格変更", price_items))
+
+    # 渲染单个商品条目为 elements 片段 (无 header/footer)
+    def render_product_item(elements, c, extra_info=""):
         p = c["product"]
         status_icon = "  " if p["available"] else "  "
         status_text = "在庫あり" if p["available"] else "在庫なし"
@@ -430,7 +446,7 @@ def build_feishu_card(changes, now_str, shop_config):
             product_md += f"\n{extra_info}"
         ctype = c.get("change_type", "")
         if ctype == "price_change":
-            product_md += f"\n{c['old_value']}    {c['new_value']}"
+            product_md += f"\n  {c['old_value']}    {c['new_value']}"
 
         if img_key:
             elements.append({
@@ -477,91 +493,140 @@ def build_feishu_card(changes, now_str, shop_config):
             }]
         })
 
-    # 渲染顺序: 上新 → 補貨 → 闪电售罄 → 普通售罄 → 価格変更
-    section_order = [
-        ("new", "  新商品上架", False),
-        ("restock", "  補貨", False),
-        ("sold_out", "   閃電售罄", True),   # lightning=True → 仅闪电
-        ("sold_out", "  售罄", False),       # lightning=False → 仅非闪电
-    ]
+    # 将 ordered_items 按 max_per_card 分页
+    # 策略: 逐个 item 放入当前卡片，超过 max_per_card 时开新卡片
+    # 每个 section header 也算一个"逻辑条目"，但如果一个卡片装不下当前 section 的全部 item，
+    # 会在下一个卡片重复 section header
 
-    for ctype, header, want_lightning in section_order:
-        if ctype == "sold_out":
-            if want_lightning:
-                items = [c for c in changes if c["change_type"] == "sold_out" and c.get("lightning")]
-            else:
-                items = [c for c in changes if c["change_type"] == "sold_out" and not c.get("lightning")]
+    cards = []
+    current_page_items = []  # [(ctype, header, [items_for_this_section_on_this_page])]
+    current_count = 0
+
+    for ctype, header, items in ordered_items:
+        # 如果当前卡片里已经有这个 section 的内容，且没有装满，继续追加
+        remaining = items[:]
+
+        if current_count >= max_per_card:
+            # 当前卡片已满，开新卡片
+            cards.append(current_page_items)
+            current_page_items = []
+            current_count = 0
+
+        # 计算当前卡片还能装多少
+        space = max_per_card - current_count
+        if len(remaining) <= space:
+            # 全部装下
+            current_page_items.append((ctype, header, remaining))
+            current_count += len(remaining)
         else:
-            items = [c for c in changes if c["change_type"] == ctype]
+            # 需要拆分 section
+            first_chunk = remaining[:space]
+            current_page_items.append((ctype, header, first_chunk))
+            current_count += len(first_chunk)
+            remaining = remaining[space:]
 
-        if not items:
-            continue
+            # 当前卡片满了，开新卡片继续放剩余的
+            while remaining:
+                cards.append(current_page_items)
+                current_page_items = []
+                current_count = 0
+                chunk = remaining[:max_per_card]
+                current_page_items.append((ctype, header, chunk))
+                current_count += len(chunk)
+                remaining = remaining[max_per_card:]
+
+    # 最后一个卡片
+    if current_page_items:
+        cards.append(current_page_items)
+
+    # 如果只有一页，不需要页码
+    total_pages = len(cards)
+    if total_pages == 0:
+        return []
+
+    # 构建每张卡片
+    result = []
+    for page_idx, page_sections in enumerate(cards):
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"  {summary}"
+                }
+            },
+            {"tag": "hr"}
+        ]
+
+        for ctype, header, items in page_sections:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**{header} ({len(items)}件)**"}
+            })
+            for c in items:
+                extra = ""
+                if c.get("lightning"):
+                    linfo = c["lightning"]
+                    source_note = {
+                        "last_available": "前回検出時",
+                        "published": "上架後",
+                        "first_seen": "初回発見時",
+                    }.get(linfo.get("source", ""), "")
+                    extra = f"    {source_note}{linfo.get('display', '')}に完売"
+                render_product_item(elements, c, extra)
+
+        elements.append({"tag": "hr"})
+
+        # 页脚: 页码信息
+        page_info = f"  {now_str}  |  {shop_config['footer']}"
+        if total_pages > 1:
+            page_info = f"  Page {page_idx+1}/{total_pages}  |  {now_str}  |  {shop_config['footer']}"
 
         elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**{header} ({len(items)}件)**"}
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": page_info}]
         })
 
-        for c in items:
-            if shown >= max_items:
-                break
+        # 标题 + 页码
+        header_title = base_header_title
+        if total_pages > 1:
+            header_title = f"  {shop_config['name']} 商品監視 ({page_idx+1}/{total_pages})"
 
-            extra = ""
-            if c.get("lightning"):
-                linfo = c["lightning"]
-                source_note = {
-                    "last_available": "前回検出時",
-                    "published": "上架後",
-                    "first_seen": "初回発見時",
-                }.get(linfo.get("source", ""), "")
-                extra = f"    {source_note}{linfo.get('display', '')}に完売"
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": header_title},
+                "template": shop_config["template_color"]
+            },
+            "elements": elements
+        }
+        result.append({"msg_type": "interactive", "card": card})
 
-            render_product_item(c, extra)
-            shown += 1
+    return result
 
-        if shown >= max_items:
-            break
 
-    # 価格変更单独处理
-    price_items = [c for c in changes if c["change_type"] == "price_change"]
-    if price_items and shown < max_items:
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**  価格変更 ({len(price_items)}件)**"}
-        })
-        for c in price_items:
-            if shown >= max_items:
-                break
-            render_product_item(c)
-            shown += 1
-
-    if total > max_items:
-        over = total - max_items
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"  他 {over} 件の変更は省略されました（表示上限 {max_items} 件）"}
-        })
-
-    elements.append({"tag": "hr"})
-    elements.append({
-        "tag": "note",
-        "elements": [{"tag": "plain_text", "content": f"  {now_str}  |  {shop_config['footer']}"}]
-    })
-
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": header_title},
-            "template": shop_config["template_color"]
-        },
-        "elements": elements
-    }
-
-    return {"msg_type": "interactive", "card": card}
+# 向后兼容：旧代码调用 build_feishu_card 返回第一张卡片（如果只有一张的话等同于原来）
+def build_feishu_card(changes, now_str, shop_config):
+    cards = build_feishu_cards(changes, now_str, shop_config)
+    return cards[0] if cards else None
 
 
 def send_feishu_card(webhook_url, card_payload, fallback_text=""):
-    """发送飞书卡片，失败时降级为纯文本"""
+    """发送飞书卡片(支持单张或多张)，失败时降级为纯文本"""
+    # 支持多卡片批量发送
+    if card_payload is None:
+        return
+    if isinstance(card_payload, list):
+        for i, payload in enumerate(card_payload):
+            if i > 0:
+                time.sleep(0.6)  # 卡片间短暂间隔，避免飞书限流
+            _send_single_feishu_card(webhook_url, payload, fallback_text if i == 0 else "")
+        return
+    _send_single_feishu_card(webhook_url, card_payload, fallback_text)
+
+
+def _send_single_feishu_card(webhook_url, card_payload, fallback_text=""):
+    """发送单张飞书卡片"""
     try:
         resp = requests.post(webhook_url, json=card_payload, timeout=15)
         result = resp.json()
