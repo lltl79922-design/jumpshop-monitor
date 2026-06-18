@@ -16,6 +16,7 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    # v2: JSON state, git-persisted, push every iter
 
     steps:
       - uses: actions/checkout@v4
