@@ -290,34 +290,40 @@ def _dispatch_notifications_ufo(cfg, conn, changes, now_str, is_first_run, silen
     if len(changes) > 10:
         logging.info(f"  ... and {len(changes)-10} more")
 
+    # 首次运行静默建基线
+    if is_first_run and not cfg.get("monitor_options", {}).get("notify_on_first_run"):
+        logging.info("First run - skipping all notifications (baseline build)")
+        return
+
+    if silent:
+        logging.info("Silent mode - skipping notifications")
+        return
+
+    # 熔断: 非首次运行时上新数>阈值
     new_count = sum(1 for c in changes if c["change_type"] == "new")
     fuse_threshold = cfg.get("monitor_options", {}).get("new_product_fuse_threshold", 150)
     if new_count > fuse_threshold:
         logging.warning(
             f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}"
         )
-        if not silent and (not is_first_run or cfg.get("monitor_options", {}).get("notify_on_first_run")):
-            summary_text = (
-                f"ufotable WEBSHOP 異常検知\n\n"
-                f"新商品数 {new_count} 件が闘値 {fuse_threshold} を超えました。\n"
-                f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
-                f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
-                f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
-                f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
-                f"{now_str} | ufotable Monitor"
+        summary_text = (
+            f"ufotable WEBSHOP 異常検知\n\n"
+            f"新商品数 {new_count} 件が闘値 {fuse_threshold} を超えました。\n"
+            f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
+            f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
+            f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
+            f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
+            f"{now_str} | ufotable Monitor"
+        )
+        feishu_cfg = cfg.get("notifications", {}).get("feishu", {})
+        if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
+            send_feishu_card(
+                feishu_cfg["webhook_url"],
+                {"msg_type": "text", "content": {"text": summary_text}},
             )
-            feishu_cfg = cfg.get("notifications", {}).get("feishu", {})
-            if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
-                send_feishu_card(
-                    feishu_cfg["webhook_url"],
-                    {"msg_type": "text", "content": {"text": summary_text}},
-                )
-    elif silent:
-        logging.info("Silent mode - skipping notifications")
-    elif is_first_run and not cfg.get("monitor_options", {}).get("notify_on_first_run"):
-        logging.info("First run - skipping notifications")
-    else:
-        send_notifications(cfg, conn, changes, now_str)
+        return
+
+    send_notifications(cfg, conn, changes, now_str)
 
 
 def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None, state_file=None):
