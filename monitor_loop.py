@@ -2,7 +2,7 @@
 """
 Jump Shop 持续监控版本 - 商品上新+补货通知 (飞书卡片+图片预览)
 用法: python monitor_loop.py
-      python monitor_loop.py --once
+      python monitor_loop.py --once --state-file=data/jumpshop_state.json --db=data/products.db
 Ctrl+C 停止
 """
 
