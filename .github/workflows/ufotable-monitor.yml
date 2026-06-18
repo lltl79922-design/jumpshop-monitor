@@ -3,9 +3,6 @@ name: ufotable WEBSHOP Monitor
 on:
   push:
     paths:
-      - 'ufotable_monitor.py'
-      - 'common.py'
-      - 'ufotable_config.example.json'
       - '.github/workflows/ufotable-monitor.yml'
   schedule:
     - cron: '17 */6 * * *'
@@ -33,7 +30,7 @@ jobs:
       - name: Setup config
         run: cp ufotable_config.example.json ufotable_config.json
 
-      - name: Monitor self-loop (JSON state, git-persisted)
+      - name: Monitor self-loop
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
@@ -46,10 +43,8 @@ jobs:
 
           mkdir -p data
 
-          # Pull latest state
           git pull --rebase origin main 2>/dev/null || true
 
-          # Init state file if needed
           if [ ! -f data/ufotable_state.json ]; then
             echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/ufotable_state.json
             echo "State file initialized (first run)"
@@ -58,6 +53,26 @@ jobs:
           git config user.email "bot@jumpshop.monitor"
           git config user.name "ufotable Monitor Bot"
 
+          push_state() {
+            local label="$1"
+            git add data/ufotable_state.json
+            if git diff --staged --quiet; then
+              echo "  [push_state:$label] no changes"
+              return 0
+            fi
+            git commit -m "bot(ufotable): state $label [skip ci]" || return 1
+            for i in 1 2 3; do
+              if git pull --rebase origin main 2>/dev/null && git push origin main 2>/dev/null; then
+                echo "  [push_state:$label] OK"
+                return 0
+              fi
+              echo "  [push_state:$label] retry $i/3..."
+              sleep 3
+            done
+            echo "  [push_state:$label] FAILED (non-fatal)"
+            return 1
+          }
+
           while true; do
             ITERATION=$((ITERATION + 1))
             ITER_START=$(date +%s)
@@ -65,24 +80,15 @@ jobs:
 
             echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] Iteration $ITERATION (elapsed: ${ELAPSED}min / ${MAX_RUNTIME_MIN}min) ==="
 
-            # Run monitor with JSON state
             python ufotable_monitor.py --once \
               --state-file=data/ufotable_state.json \
               --db=data/ufotable.db || echo "Monitor iteration failed"
 
-            # Mid-loop state push: every 60 iterations (~1 hour)
-            if [ $((ITERATION % 60)) -eq 0 ]; then
-              echo "Mid-loop state save to git..."
-              git add data/ufotable_state.json
-              if git diff --staged --quiet; then
-                echo "  (no state changes)"
-              else
-                git commit -m "bot(ufotable): state checkpoint #$ITERATION [skip ci]" || true
-                (git pull --rebase origin main && git push origin main) 2>/dev/null || echo "  Push failed (non-fatal)"
-              fi
+            # Push state aggressively early on, then every 10 iterations
+            if [ $ITERATION -le 3 ] || [ $((ITERATION % 10)) -eq 0 ]; then
+              push_state "iter$ITERATION"
             fi
 
-            # Check time limit
             NOW=$(date +%s)
             ELAPSED=$(( (NOW - START_TIME) / 60 ))
             if [ $ELAPSED -ge $MAX_RUNTIME_MIN ]; then
@@ -98,20 +104,4 @@ jobs:
           done
 
           echo "Self-loop ended after $ITERATION iterations"
-
-      - name: Save final state to git
-        if: always()
-        run: |
-          git config user.email "bot@jumpshop.monitor"
-          git config user.name "ufotable Monitor Bot"
-          git add data/ufotable_state.json
-          if git diff --staged --quiet; then
-            echo "No state changes to save"
-          else
-            git commit -m "bot(ufotable): final state [skip ci]" || true
-            for i in 1 2 3; do
-              git pull --rebase origin main && git push origin main && break
-              echo "Push retry $i/3..."
-              sleep 5
-            done || echo "State push failed after 3 retries"
-          fi
+          push_state "final"

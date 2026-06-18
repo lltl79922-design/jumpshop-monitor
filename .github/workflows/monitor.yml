@@ -3,12 +3,8 @@ name: Jump Shop Monitor
 on:
   push:
     paths:
-      - 'monitor_loop.py'
-      - 'common.py'
-      - 'config.example.json'
       - '.github/workflows/monitor.yml'
   schedule:
-    # 每6小时触发新job (自循环最长跑350分钟)
     - cron: '7 */6 * * *'
   workflow_dispatch:
 
@@ -34,7 +30,7 @@ jobs:
       - name: Setup config
         run: cp config.example.json config.json
 
-      - name: Monitor self-loop (JSON state, git-persisted)
+      - name: Monitor self-loop
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
@@ -45,13 +41,12 @@ jobs:
           START_TIME=$(date +%s)
           ITERATION=0
 
-          # Setup state file directory
           mkdir -p data
 
-          # Pull latest state from remote
+          # Pull latest state from git
           git pull --rebase origin main 2>/dev/null || true
 
-          # Init state file if not exists (e.g. first run ever)
+          # Init state file if first run ever
           if [ ! -f data/jumpshop_state.json ]; then
             echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/jumpshop_state.json
             echo "State file initialized (first run)"
@@ -60,6 +55,27 @@ jobs:
           git config user.email "bot@jumpshop.monitor"
           git config user.name "Jump Shop Monitor Bot"
 
+          # Helper: push state to git (best-effort, with retry)
+          push_state() {
+            local label="$1"
+            git add data/jumpshop_state.json
+            if git diff --staged --quiet; then
+              echo "  [push_state:$label] no changes"
+              return 0
+            fi
+            git commit -m "bot(jumpshop): state $label [skip ci]" || return 1
+            for i in 1 2 3; do
+              if git pull --rebase origin main 2>/dev/null && git push origin main 2>/dev/null; then
+                echo "  [push_state:$label] OK"
+                return 0
+              fi
+              echo "  [push_state:$label] retry $i/3..."
+              sleep 3
+            done
+            echo "  [push_state:$label] FAILED (non-fatal)"
+            return 1
+          }
+
           while true; do
             ITERATION=$((ITERATION + 1))
             ITER_START=$(date +%s)
@@ -67,21 +83,14 @@ jobs:
 
             echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] Iteration $ITERATION (elapsed: ${ELAPSED}min / ${MAX_RUNTIME_MIN}min) ==="
 
-            # Run monitor with JSON state (DB optional, for change_log only)
+            # Run monitor
             python monitor_loop.py --once \
               --state-file=data/jumpshop_state.json \
               --db=data/products.db || echo "Monitor iteration failed"
 
-            # Mid-loop state push: every 60 iterations (~1 hour)
-            if [ $((ITERATION % 60)) -eq 0 ]; then
-              echo "Mid-loop state save to git..."
-              git add data/jumpshop_state.json
-              if git diff --staged --quiet; then
-                echo "  (no state changes)"
-              else
-                git commit -m "bot(jumpshop): state checkpoint #$ITERATION [skip ci]" || true
-                (git pull --rebase origin main && git push origin main) 2>/dev/null || echo "  Push failed (non-fatal)"
-              fi
+            # Push state aggressively early on (iterations 1-3), then every 10
+            if [ $ITERATION -le 3 ] || [ $((ITERATION % 10)) -eq 0 ]; then
+              push_state "iter$ITERATION"
             fi
 
             # Check time limit
@@ -92,7 +101,7 @@ jobs:
               break
             fi
 
-            # Sleep to maintain ~60s interval
+            # Sleep to maintain ~60s interval (min 5s)
             ITER_TOOK=$(( NOW - ITER_START ))
             SLEEP_TIME=$(( 60 - ITER_TOOK ))
             [ $SLEEP_TIME -lt 5 ] && SLEEP_TIME=5
@@ -101,20 +110,4 @@ jobs:
           done
 
           echo "Self-loop ended after $ITERATION iterations"
-
-      - name: Save final state to git
-        if: always()
-        run: |
-          git config user.email "bot@jumpshop.monitor"
-          git config user.name "Jump Shop Monitor Bot"
-          git add data/jumpshop_state.json
-          if git diff --staged --quiet; then
-            echo "No state changes to save"
-          else
-            git commit -m "bot(jumpshop): final state [skip ci]" || true
-            for i in 1 2 3; do
-              git pull --rebase origin main && git push origin main && break
-              echo "Push retry $i/3..."
-              sleep 5
-            done || echo "State push failed after 3 retries"
-          fi
+          push_state "final"
