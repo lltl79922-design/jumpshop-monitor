@@ -8,6 +8,9 @@ on:
     - cron: '7 */6 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write  # needed for git push state files
+
 concurrency:
   group: jumpshop-monitor
   cancel-in-progress: true
