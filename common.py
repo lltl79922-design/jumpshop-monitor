@@ -863,6 +863,10 @@ def detect_all_changes_from_state(old_state, products, now_str, cfg):
 
         for pid_str in newly_soldout:
             if pid_str not in existing_ids:
+                # 交叉校验: 旧 per-product 状态如果已经是售罄, 跳过(已通知过)
+                old = old_products.get(pid_str)
+                if old and old.get("available") == 0:
+                    continue
                 p = product_map.get(pid_str)
                 if p:
                     changes.append({
@@ -873,6 +877,10 @@ def detect_all_changes_from_state(old_state, products, now_str, cfg):
 
         for pid_str in newly_restocked:
             if pid_str not in existing_ids:
+                # 交叉校验: 旧 per-product 状态如果已经是补货, 跳过
+                old = old_products.get(pid_str)
+                if old and old.get("available") == 1:
+                    continue
                 p = product_map.get(pid_str)
                 if p:
                     changes.append({
