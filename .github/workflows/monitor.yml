@@ -64,9 +64,9 @@ jobs:
               echo "  [push_state:$label] no changes"
               return 0
             fi
-            git commit -m "bot(jumpshop): state $label [skip ci]" || return 1
+            git commit -m "bot(jumpshop): state $label [skip ci]" || { echo "  [push_state:$label] commit failed"; return 1; }
             for i in 1 2 3; do
-              if git pull --rebase origin main 2>/dev/null && git push origin main 2>/dev/null; then
+              if git pull --rebase origin main 2>/dev/null && git push origin main 2>&1; then
                 echo "  [push_state:$label] OK"
                 return 0
               fi
