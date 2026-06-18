@@ -1,13 +1,21 @@
 # Jump Shop 监控 - 忽略文件
 data/products.db
+data/products.db-*
+data/ufotable.db
+data/ufotable.db-*
 *.log
 data/monitor.log
+data/ufotable_*.log
 __pycache__/
 *.pyc
 test_*.py
 config.json
-
 ufotable_config.json
-ufotable.db
-ufotable.db-*
-ufotable_*.log
+
+# 状态快照 (旧格式)
+data/state_snapshot.json
+data/ufotable_state_snapshot.json
+data/*_preheal.json
+
+# !!! 不忽略 JSON State 文件 — 它们是 Git 持久化的核心 !!!
+# data/jumpshop_state.json  and  data/ufotable_state.json  are TRACKED

@@ -26,6 +26,9 @@ from common import (
     build_feishu_cards, send_feishu_card,
     maybe_send_bot_alert,
     save_state_snapshot, load_state_snapshot, detect_changes_from_snapshot,
+    load_json_state, save_json_state,
+    detect_all_changes_from_state, detect_lightning_from_state,
+    build_new_state,
 )
 
 running = True
@@ -152,30 +155,37 @@ def fetch_data():
 
 
 def normalize_product(p, stock_map):
-    var = p.get("variations", [{}])[0] if p.get("variations") else {}
-    code = var.get("productCode", "")
-    images = p.get("images", [])
-    image_url = images[0]["url"] if images else ""
+    """安全解析 ufotable 商品数据，处理缺失/异常字段"""
+    var = (p.get("variations") or [{}])[0]
+    if not isinstance(var, dict):
+        var = {}
+    code = var.get("productCode", "") or ""
+    images = p.get("images") or []
+    image_url = ""
+    if images and isinstance(images[0], dict):
+        image_url = images[0].get("url", "") or ""
 
     works = ""
     category = ""
-    for cat in p.get("categories", []):
+    for cat in (p.get("categories") or []):
+        if not isinstance(cat, dict):
+            continue
         if cat.get("groupName") == "works":
-            works = cat.get("displayName", "")
+            works = cat.get("displayName", "") or ""
         if cat.get("groupName") == "category":
-            category = cat.get("displayName", "")
+            category = cat.get("displayName", "") or ""
 
     return {
-        "id": p["id"],
+        "id": p.get("id", 0),
         "product_code": code,
-        "title": p["title"],
+        "title": p.get("title", ""),
         "works": works,
         "category": category,
-        "price": var.get("price", 0),
+        "price": var.get("price", 0) or 0,
         "available": 1 if stock_map.get(code, False) else 0,
         "image_url": image_url,
         "url": f"{SHOP_URL}/product/{code}" if code else SHOP_URL,
-        "valid_after": p.get("validAfter", ""),
+        "valid_after": p.get("validAfter", "") or "",
     }
 
 
@@ -265,7 +275,52 @@ def send_notifications(cfg, conn, changes, now_str):
             )
 
 
-def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
+def _dispatch_notifications_ufo(cfg, conn, changes, now_str, is_first_run, silent):
+    """统一的变更通知分发逻辑"""
+    if not changes:
+        return
+
+    logging.info(f"Detected {len(changes)} changes")
+    for c in changes[:10]:
+        p = c["product"]
+        label = CHANGE_LABELS[c['change_type']]
+        if c.get("lightning"):
+            label += " ⚡"
+        logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
+    if len(changes) > 10:
+        logging.info(f"  ... and {len(changes)-10} more")
+
+    new_count = sum(1 for c in changes if c["change_type"] == "new")
+    fuse_threshold = cfg.get("monitor_options", {}).get("new_product_fuse_threshold", 150)
+    if new_count > fuse_threshold:
+        logging.warning(
+            f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}"
+        )
+        if not silent and (not is_first_run or cfg.get("monitor_options", {}).get("notify_on_first_run")):
+            summary_text = (
+                f"ufotable WEBSHOP 異常検知\n\n"
+                f"新商品数 {new_count} 件が闘値 {fuse_threshold} を超えました。\n"
+                f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
+                f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
+                f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
+                f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
+                f"{now_str} | ufotable Monitor"
+            )
+            feishu_cfg = cfg.get("notifications", {}).get("feishu", {})
+            if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
+                send_feishu_card(
+                    feishu_cfg["webhook_url"],
+                    {"msg_type": "text", "content": {"text": summary_text}},
+                )
+    elif silent:
+        logging.info("Silent mode - skipping notifications")
+    elif is_first_run and not cfg.get("monitor_options", {}).get("notify_on_first_run"):
+        logging.info("First run - skipping notifications")
+    else:
+        send_notifications(cfg, conn, changes, now_str)
+
+
+def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None, state_file=None):
     start = time.time()
     logging.info("Checking ufotable WEBSHOP...")
 
@@ -277,7 +332,69 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
     products = [normalize_product(p, stock_map) for p in products_raw]
     now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
 
-    # 灾难恢复: 自愈后用旧快照对比当前API数据
+    # ---- 产品数异常检测 ----
+    min_expected = cfg.get("monitor_options", {}).get("min_product_count", 10)
+    if len(products) < min_expected:
+        logging.error(
+            "PRODUCT COUNT ANOMALY: got %d products, expected >= %d. Skipping cycle.",
+            len(products), min_expected
+        )
+        return 0
+
+    # ---- JSON State 模式 (主路径) ----
+    if state_file:
+        old_state = load_json_state(state_file)
+        first_run = len(old_state.get("products", {})) == 0
+
+        if first_run:
+            logging.info("First run with JSON state - building baseline...")
+
+        # 产品数突变检测
+        old_total = old_state.get("total_products", 0)
+        if old_total > 0:
+            ratio = len(products) / old_total
+            if ratio < 0.5 or ratio > 1.5:
+                logging.warning(
+                    "PRODUCT COUNT DRIFT: %d → %d (%.0f%%). Possible API issue.",
+                    old_total, len(products), ratio * 100
+                )
+
+        changes, soldout_ids = detect_all_changes_from_state(old_state, products, now_str, cfg)
+
+        lightning_threshold = cfg.get("monitor_options", {}).get("lightning_sellout_threshold_seconds", 300)
+        detect_lightning_from_state(old_state, changes, now_str, lightning_threshold)
+
+        new_products = build_new_state(products, old_state, now_str)
+        new_state = {
+            "version": 2,
+            "updated_at": now_str,
+            "total_products": len(products),
+            "soldout_ids": soldout_ids,
+            "products": new_products,
+        }
+
+        _dispatch_notifications_ufo(cfg, conn, changes, now_str,
+                                    is_first_run=first_run, silent=silent)
+
+        if changes and conn:
+            try:
+                log_changes(conn, changes, now_str)
+            except Exception as e:
+                logging.warning("Failed to log changes to DB: %s", e)
+
+        save_json_state(new_state, state_file)
+
+        if conn:
+            try:
+                update_db(conn, products, now_str)
+            except Exception as e:
+                logging.warning("Failed to update DB: %s", e)
+
+        elapsed = time.time() - start
+        logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked (JSON state)")
+        return len(changes)
+
+    # ---- DB 模式 (向后兼容) ----
     recovered_changes = []
     if recover_from:
         old_snapshot = load_state_snapshot(recover_from)
@@ -287,11 +404,9 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
 
     changes, _ = detect_changes(conn, products, cfg)
 
-    # 快照对比: 补充 per-product 检测可能漏掉的售罄/補貨
     detect_sold_out = cfg.get("monitor_options", {}).get("detect_sold_out", True)
     snapshot_changes = detect_soldout_delta(conn, products, detect_sold_out, now_str)
 
-    # 合并: per-product > snapshot > recovered (去重)
     existing_ids = {c["product_id"]: c for c in changes}
     for sc in snapshot_changes:
         if sc["product_id"] not in existing_ids:
@@ -301,62 +416,25 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         if rc["product_id"] not in existing_ids:
             changes.append(rc)
 
-    # 闪电售罄检测: 分析售罄商品的实际耗时 (ufotable 用 valid_after 作为上架时间)
     lightning_threshold = cfg.get("monitor_options", {}).get("lightning_sellout_threshold_seconds", 300)
     detect_lightning_sellouts(conn, changes, now_str, lightning_threshold, publish_field="valid_after")
 
-    # 通知策略: 恢复模式下仅发送从快照恢复的变更
-    if changes:
-        logging.info(f"Detected {len(changes)} changes")
-        for c in changes[:10]:
-            p = c["product"]
-            label = CHANGE_LABELS[c['change_type']]
-            if c.get("lightning"):
-                label += " ⚡"
-            logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
-        if len(changes) > 10:
-            logging.info(f"  ... and {len(changes)-10} more")
-
-        # 熔断: 上新数超过阈值 → 降级为纯文本摘要
-        new_count = sum(1 for c in changes if c["change_type"] == "new")
-        fuse_threshold = cfg.get("monitor_options", {}).get("new_product_fuse_threshold", 150)
-        if new_count > fuse_threshold:
-            logging.warning(
-                f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}. "
-                "Likely cache corruption — sending summary only."
-            )
-            if not silent and (not is_first_run or cfg.get("monitor_options", {}).get("notify_on_first_run")):
-                summary_text = (
-                    f"ufotable WEBSHOP 異常検知\n\n"
-                    f"新商品数 {new_count} 件が閾値 {fuse_threshold} を超えました。\n"
-                    f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
-                    f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
-                    f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
-                    f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
-                    f"{now_str} | ufotable Monitor"
-                )
-                feishu_cfg = cfg.get("notifications", {}).get("feishu", {})
-                if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
-                    send_feishu_card(
-                        feishu_cfg["webhook_url"],
-                        {"msg_type": "text", "content": {"text": summary_text}},
-                    )
-        elif silent:
-            logging.info("Silent mode - skipping notifications")
-        elif is_first_run and recovered_changes and not cfg.get("monitor_options", {}).get("notify_on_first_run"):
-            notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
-            logging.info(f"Recovery mode: sending {len(notify_changes)}/{len(changes)} recovered changes")
-            if notify_changes:
-                send_notifications(cfg, conn, notify_changes, now_str)
-        elif not is_first_run or cfg.get("monitor_options", {}).get("notify_on_first_run"):
-            send_notifications(cfg, conn, changes, now_str)
-        log_changes(conn, changes, now_str)
+    notify_is_first = is_first_run and bool(recovered_changes) and not cfg.get("monitor_options", {}).get("notify_on_first_run")
+    if notify_is_first:
+        notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
+        logging.info(f"Recovery mode: sending {len(notify_changes)}/{len(changes)} recovered changes")
+        _dispatch_notifications_ufo(cfg, conn, notify_changes, now_str,
+                                    is_first_run=False, silent=silent)
     else:
-        logging.info("No changes")
+        _dispatch_notifications_ufo(cfg, conn, changes, now_str,
+                                    is_first_run=is_first_run and not recovered_changes,
+                                    silent=silent)
+
+    if changes:
+        log_changes(conn, changes, now_str)
 
     update_db(conn, products, now_str)
 
-    # 每次成功运行后保存状态快照
     snapshot_path = cfg.get("state_snapshot_path", "data/ufotable_state_snapshot.json")
     try:
         rows = conn.execute(
@@ -375,7 +453,7 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         logging.warning(f"Failed to save state snapshot: {e}")
 
     elapsed = time.time() - start
-    logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked")
+    logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked (DB mode)")
     return len(changes)
 
 
@@ -388,21 +466,26 @@ def signal_handler(sig, frame):
 def main():
     global running
     cfg = load_config()
-    db_path = cfg.get("database_path", "data/ufotable.db")
+    db_path_default = cfg.get("database_path", "data/ufotable.db")
     setup_logging(cfg.get("log_file", "data/ufotable_monitor.log"),
                   fmt="%(asctime)s [UFOTABLE] %(message)s")
-    conn = init_db(db_path)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    cur = conn.execute("SELECT COUNT(*) FROM products")
-    is_first_run = cur.fetchone()[0] == 0
-
-    if is_first_run:
-        logging.info("First run - building baseline database...")
-
+    # 解析命令行参数
     silent = "--silent" in sys.argv
+
+    state_file = None
+    for arg in sys.argv:
+        if arg.startswith("--state-file="):
+            state_file = arg.split("=", 1)[1]
+        elif arg == "--state-file" and sys.argv.index(arg) + 1 < len(sys.argv):
+            state_file = sys.argv[sys.argv.index(arg) + 1]
+
+    db_path = None
+    for arg in sys.argv:
+        if arg.startswith("--db="):
+            db_path = arg.split("=", 1)[1]
+        elif arg == "--db" and sys.argv.index(arg) + 1 < len(sys.argv):
+            db_path = sys.argv[sys.argv.index(arg) + 1]
 
     recover_from = None
     for arg in sys.argv:
@@ -411,9 +494,39 @@ def main():
         elif arg == "--recover-from" and sys.argv.index(arg) + 1 < len(sys.argv):
             recover_from = sys.argv[sys.argv.index(arg) + 1]
 
+    # 初始化 DB
+    conn = None
+    if state_file:
+        target_db = db_path or db_path_default
+        try:
+            conn = init_db(target_db)
+        except Exception as e:
+            logging.warning("DB init failed (non-fatal in state-file mode): %s", e)
+    else:
+        conn = init_db(db_path or db_path_default)
+
+    # 判断是否首次运行
+    is_first_run = False
+    if conn:
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM products")
+            is_first_run = cur.fetchone()[0] == 0
+        except Exception:
+            is_first_run = True
+    elif state_file:
+        is_first_run = not Path(state_file).exists()
+
+    if is_first_run:
+        logging.info("First run - building baseline...")
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     if "--once" in sys.argv:
-        run_once(cfg, conn, is_first_run=is_first_run, silent=silent, recover_from=recover_from)
-        conn.close()
+        run_once(cfg, conn, is_first_run=is_first_run, silent=silent,
+                 recover_from=recover_from, state_file=state_file)
+        if conn:
+            conn.close()
         return
 
     interval = cfg.get("poll_interval_seconds", 300)
@@ -421,9 +534,15 @@ def main():
 
     while running:
         try:
-            run_once(cfg, conn, is_first_run=is_first_run, silent=silent, recover_from=recover_from)
+            run_once(cfg, conn, is_first_run=is_first_run, silent=silent,
+                     recover_from=recover_from, state_file=state_file)
             is_first_run = False
             recover_from = None
+        except KeyboardInterrupt:
+            logging.info("Keyboard interrupt received")
+            break
+        except SystemExit:
+            break
         except Exception as e:
             logging.error(f"Run failed: {e}", exc_info=True)
         if not running:
@@ -436,7 +555,8 @@ def main():
                 break
             time.sleep(1)
 
-    conn.close()
+    if conn:
+        conn.close()
     logging.info("Monitor stopped")
 
 

@@ -36,8 +36,10 @@
         "lightning_sellout_threshold_seconds": 300,
         "bot_alert_min_count": 3,
         "bot_alert_enabled": true,
-        "new_product_fuse_threshold": 150
+        "new_product_fuse_threshold": 150,
+        "min_product_count": 100
     },
+    "state_file": "data/jumpshop_state.json",
     "database_path": "data/products.db",
     "log_file": "data/monitor.log"
 }

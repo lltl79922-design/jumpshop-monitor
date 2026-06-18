@@ -8,11 +8,10 @@ on:
       - 'config.example.json'
       - '.github/workflows/monitor.yml'
   schedule:
-    # 每6小时触发新job作为安全网 (自循环job最长跑350分钟)
+    # 每6小时触发新job (自循环最长跑350分钟)
     - cron: '7 */6 * * *'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
-# 防止并发: 新触发自动取消旧job, 避免重复推送
 concurrency:
   group: jumpshop-monitor
   cancel-in-progress: true
@@ -20,7 +19,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6小时, 自循环在此之内
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
@@ -32,33 +31,10 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Restore DB from cache
-        uses: actions/cache/restore@v4
-        id: cache-db
-        with:
-          path: |
-            data/products.db
-            data/state_snapshot.json
-          key: jumpshop-db-v3-${{ github.run_id }}
-          restore-keys: |
-            jumpshop-db-v3-
-            jumpshop-db-v2-
-
-      - name: Repair DB (clean stale WAL)
-        run: |
-          mkdir -p data
-          rm -f data/products.db-wal data/products.db-shm
-          python -c "
-          import sqlite3
-          conn = sqlite3.connect('data/products.db')
-          conn.execute('PRAGMA integrity_check')
-          conn.close()
-          "
-
       - name: Setup config
         run: cp config.example.json config.json
 
-      - name: Monitor self-loop (~1 min interval, max 350 min)
+      - name: Monitor self-loop (JSON state, git-persisted)
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
@@ -69,6 +45,21 @@ jobs:
           START_TIME=$(date +%s)
           ITERATION=0
 
+          # Setup state file directory
+          mkdir -p data
+
+          # Pull latest state from remote
+          git pull --rebase origin main 2>/dev/null || true
+
+          # Init state file if not exists (e.g. first run ever)
+          if [ ! -f data/jumpshop_state.json ]; then
+            echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/jumpshop_state.json
+            echo "State file initialized (first run)"
+          fi
+
+          git config user.email "bot@jumpshop.monitor"
+          git config user.name "Jump Shop Monitor Bot"
+
           while true; do
             ITERATION=$((ITERATION + 1))
             ITER_START=$(date +%s)
@@ -76,96 +67,54 @@ jobs:
 
             echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] Iteration $ITERATION (elapsed: ${ELAPSED}min / ${MAX_RUNTIME_MIN}min) ==="
 
-            # Run monitor
-            if python monitor_loop.py --once; then
-              echo "Monitor OK"
-            else
-              echo "Monitor FAILED, attempting self-heal..."
-              # 1. Save pre-heal snapshot from the (possibly corrupted) DB
-              python -c "
-              import json, sqlite3
-              from pathlib import Path
-              db = Path('data/products.db')
-              if db.exists():
-                  try:
-                      conn = sqlite3.connect(str(db))
-                      rows = conn.execute('SELECT id, title, available, price, image_url, url, vendor, handle FROM products').fetchall()
-                      snap = {}
-                      for r in rows:
-                          snap[str(r[0])] = {'title':r[1], 'available':r[2], 'price':r[3], 'image_url':r[4], 'url':r[5], 'vendor':r[6], 'handle':r[7]}
-                      conn.close()
-                      Path('data').mkdir(parents=True, exist_ok=True)
-                      with open('data/state_snapshot_preheal.json', 'w', encoding='utf-8') as f:
-                          json.dump(snap, f, ensure_ascii=False)
-                      print(f'Pre-heal snapshot saved: {len(snap)} products')
-                  except Exception as e:
-                      print(f'Could not save pre-heal snapshot: {e}')
-              else:
-                  print('No old DB to snapshot')
-              "
-              # 2. Delete corrupted DB
-              rm -f data/products.db data/products.db-wal data/products.db-shm
-              # 3. Rebuild empty DB
-              python -c "
-              import sqlite3
-              conn = sqlite3.connect('data/products.db')
-              conn.execute('PRAGMA journal_mode=WAL')
-              conn.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, title TEXT, handle TEXT, vendor TEXT, tags TEXT, price INTEGER, available INTEGER, sku TEXT, image_url TEXT, url TEXT, published_at TEXT, updated_at TEXT, first_seen TEXT, last_checked TEXT, feishu_img_key TEXT DEFAULT \"\", last_available_at TEXT DEFAULT \"\")')
-              conn.execute('CREATE TABLE IF NOT EXISTS change_log (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, change_type TEXT, old_value TEXT, new_value TEXT, detected_at TEXT, notified INTEGER DEFAULT 0)')
-              conn.execute('CREATE TABLE IF NOT EXISTS soldout_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), soldout_ids TEXT DEFAULT \"[]\", updated_at TEXT DEFAULT \"\")')
-              conn.execute('INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at) VALUES (1, \"[]\", \"\")')
-              conn.commit()
-              conn.close()
-              "
-              # 4. Recover with snapshot
-              if [ -f data/state_snapshot_preheal.json ]; then
-                echo "Recovering with pre-heal snapshot..."
-                python monitor_loop.py --once --recover-from=data/state_snapshot_preheal.json
-              elif [ -f data/state_snapshot.json ]; then
-                echo "Recovering with cached state snapshot..."
-                python monitor_loop.py --once --recover-from=data/state_snapshot.json
+            # Run monitor with JSON state (DB optional, for change_log only)
+            python monitor_loop.py --once \
+              --state-file=data/jumpshop_state.json \
+              --db=data/products.db || echo "Monitor iteration failed"
+
+            # Mid-loop state push: every 60 iterations (~1 hour)
+            if [ $((ITERATION % 60)) -eq 0 ]; then
+              echo "Mid-loop state save to git..."
+              git add data/jumpshop_state.json
+              if git diff --staged --quiet; then
+                echo "  (no state changes)"
               else
-                echo "No snapshot available, fresh baseline..."
-                python monitor_loop.py --once --silent
+                git commit -m "bot(jumpshop): state checkpoint #$ITERATION [skip ci]" || true
+                (git pull --rebase origin main && git push origin main) 2>/dev/null || echo "  Push failed (non-fatal)"
               fi
-              echo "Self-heal complete"
             fi
 
             # Check time limit
             NOW=$(date +%s)
             ELAPSED=$(( (NOW - START_TIME) / 60 ))
             if [ $ELAPSED -ge $MAX_RUNTIME_MIN ]; then
-              echo "Time limit reached (${ELAPSED}min >= ${MAX_RUNTIME_MIN}min), stopping loop"
+              echo "Time limit reached (${ELAPSED}min >= ${MAX_RUNTIME_MIN}min)"
               break
             fi
 
-            # Calculate sleep to maintain ~60s interval (min sleep 5s)
+            # Sleep to maintain ~60s interval
             ITER_TOOK=$(( NOW - ITER_START ))
             SLEEP_TIME=$(( 60 - ITER_TOOK ))
-            if [ $SLEEP_TIME -lt 5 ]; then
-              SLEEP_TIME=5
-            fi
+            [ $SLEEP_TIME -lt 5 ] && SLEEP_TIME=5
             echo "Iteration took ${ITER_TOOK}s, sleeping ${SLEEP_TIME}s..."
             sleep $SLEEP_TIME
           done
 
           echo "Self-loop ended after $ITERATION iterations"
 
-      - name: Checkpoint DB (flush WAL to file)
+      - name: Save final state to git
         if: always()
         run: |
-          python -c "
-          import sqlite3
-          conn = sqlite3.connect('data/products.db')
-          conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-          conn.close()
-          "
-
-      - name: Save DB to cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            data/products.db
-            data/state_snapshot.json
-          key: jumpshop-db-v3-${{ github.run_id }}
+          git config user.email "bot@jumpshop.monitor"
+          git config user.name "Jump Shop Monitor Bot"
+          git add data/jumpshop_state.json
+          if git diff --staged --quiet; then
+            echo "No state changes to save"
+          else
+            git commit -m "bot(jumpshop): final state [skip ci]" || true
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push origin main && break
+              echo "Push retry $i/3..."
+              sleep 5
+            done || echo "State push failed after 3 retries"
+          fi

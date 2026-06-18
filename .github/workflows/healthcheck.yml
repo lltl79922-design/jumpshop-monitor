@@ -8,12 +8,9 @@ on:
       - 'config.example.json'
       - '.github/workflows/healthcheck.yml'
   schedule:
-    # 北京时间 2:00 = UTC 18:00
-    - cron: '37 18 * * *'
-    # 北京时间 4:00 = UTC 20:00 (备用)
-    - cron: '37 20 * * *'
-    # 北京时间 6:00 = UTC 22:00 (备用)
-    - cron: '37 22 * * *'
+    - cron: '37 18 * * *'  # 北京时间 2:37
+    - cron: '37 20 * * *'  # 北京时间 4:37
+    - cron: '37 22 * * *'  # 北京时间 6:37
   workflow_dispatch:
 
 concurrency:
@@ -38,17 +35,8 @@ jobs:
       - name: Setup config
         run: cp config.example.json config.json
 
-      - name: Restore DB cache
-        uses: actions/cache/restore@v4
-        id: cache-db
-        with:
-          path: |
-            data/products.db
-            data/state_snapshot.json
-          key: jumpshop-db-v3-${{ github.run_id }}
-          restore-keys: |
-            jumpshop-db-v3-
-            jumpshop-db-v2-
+      - name: Pull latest state
+        run: git pull --rebase origin main 2>/dev/null || true
 
       - name: Run Healthcheck
         env:
@@ -57,73 +45,96 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python healthcheck.py
-
-      - name: Auto-Rebuild DB (if needed)
-        env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
         run: |
-          # 如果数据库坏了，尝试用快照恢复
           python -c "
-          import sqlite3, sys
+          import json, sys, os, logging
+          from datetime import datetime, timezone, timedelta
           from pathlib import Path
-          if Path('data/products.db').exists():
-              try:
-                  conn = sqlite3.connect('data/products.db')
-                  result = conn.execute('PRAGMA integrity_check').fetchone()
-                  conn.close()
-                  if result[0] == 'ok':
-                      print('DB OK')
-                      sys.exit(0)
-                  else:
-                      print(f'DB corrupt: {result[0]}')
-              except Exception as e:
-                  print(f'DB error: {e}')
-          else:
-              print('DB not found')
-          sys.exit(1)
-          " || (
-            echo "DB broken, rebuilding with snapshot recovery..."
-            # 1. 从旧DB尝试导出快照(兜底)
-            python -c "
-            import json, sqlite3
-            from pathlib import Path
-            db = Path('data/products.db')
-            if db.exists():
-                try:
-                    conn = sqlite3.connect(str(db))
-                    rows = conn.execute('SELECT id, title, available, price, image_url, url, vendor, handle FROM products').fetchall()
-                    snap = {}
-                    for r in rows:
-                        snap[str(r[0])] = {'title':r[1], 'available':r[2], 'price':r[3], 'image_url':r[4], 'url':r[5], 'vendor':r[6], 'handle':r[7]}
-                    conn.close()
-                    with open('data/state_snapshot_preheal.json', 'w', encoding='utf-8') as f:
-                        json.dump(snap, f, ensure_ascii=False)
-                    print(f'Pre-heal snapshot: {len(snap)} products')
-                except Exception as e:
-                    print(f'Snapshot failed: {e}')
-            "
-            # 2. 删库重建
-            rm -f data/products.db data/products.db-wal data/products.db-shm
-            # 3. 确定用哪个快照
-            if [ -f data/state_snapshot_preheal.json ]; then SNAP=data/state_snapshot_preheal.json
-            elif [ -f data/state_snapshot.json ]; then SNAP=data/state_snapshot.json
-            else SNAP=""; fi
-            # 4. 重建基线(含快照恢复)
-            if [ -n "$SNAP" ]; then
-              python healthcheck.py --rebuild --recover-from="$SNAP"
-            else
-              python healthcheck.py --rebuild
-            fi
-          )
+          import requests
 
-      - name: Save DB to cache
+          JST = timezone(timedelta(hours=9))
+          issues = []
+
+          # 1. Check API
+          print('=== Jump Shop Healthcheck ===')
+          try:
+              r = requests.get('https://jumpshop-benelic.com/products.json?limit=1',
+                               headers={'User-Agent': 'HealthCheck/2.0', 'Accept': 'application/json'},
+                               timeout=20)
+              if r.status_code == 200:
+                  data = r.json()
+                  count = len(data.get('products', []))
+                  print(f'  API OK: {r.status_code} (sample: {count} products)')
+              else:
+                  issues.append(f'API 返回 {r.status_code}')
+                  print(f'  API WARN: {r.status_code}')
+          except Exception as e:
+              issues.append(f'API 不通: {e}')
+              print(f'  API FAIL: {e}')
+
+          # 2. Check JSON state file
+          state_file = Path('data/jumpshop_state.json')
+          if state_file.exists():
+              try:
+                  state = json.loads(state_file.read_text(encoding='utf-8'))
+                  product_count = len(state.get('products', {}))
+                  updated_at = state.get('updated_at', 'unknown')
+                  print(f'  State OK: {product_count} products, updated {updated_at}')
+
+                  # Dead-man check: state should be <2 hours old when monitor is active
+                  if updated_at:
+                      try:
+                          update_dt = None
+                          ts = updated_at.strip()
+                          if 'JST' in ts:
+                              update_dt = datetime.strptime(ts.replace(' JST', ''), '%Y-%m-%d %H:%M:%S').replace(tzinfo=JST)
+                          else:
+                              update_dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                          age = (datetime.now(JST) - update_dt.replace(tzinfo=JST) if update_dt.tzinfo is None else datetime.now(JST) - update_dt).total_seconds()
+                          age_min = int(age / 60)
+                          if age_min > 120:
+                              issues.append(f'状态文件 {age_min} 分钟未更新 (死人开关触发)')
+                              print(f'  DEAD MAN: state is {age_min}min old!')
+                          else:
+                              print(f'  State age: {age_min}min (OK)')
+                      except Exception as e:
+                          print(f'  State age check skipped: {e}')
+              except Exception as e:
+                  issues.append(f'状态文件损坏: {e}')
+                  print(f'  State FAIL: {e}')
+          else:
+              issues.append('状态文件不存在')
+              print('  State MISSING')
+
+          # 3. Send report
+          nc = json.load(open('config.example.json'))['notifications']['feishu']
+          webhook = os.environ.get('FEISHU_WEBHOOK_URL', nc.get('webhook_url', ''))
+          if webhook and 'YOUR_' not in webhook:
+              if issues:
+                  status_icon = ''
+                  text = f'{status_icon} **Jump Shop 自检异常**\n\n' + '\n'.join(f'- {i}' for i in issues)
+                  text += f'\n\n时间: {datetime.now(JST).strftime(\"%Y-%m-%d %H:%M:%S\")} JST'
+              else:
+                  text = f' **Jump Shop 自检报告**\n\n  全部正常\n  ' + 'API / 状態ファイル / 監視頻度 すべて正常'
+                  text += f'\n\n时间: {datetime.now(JST).strftime(\"%Y-%m-%d %H:%M:%S\")} JST'
+
+              if issues:
+                  r = requests.post(webhook, json={'msg_type': 'text', 'content': {'text': text}}, timeout=15)
+                  print(f'  Alert sent: {r.json().get(\"code\")}')
+              else:
+                  print('  All OK, no alert needed')
+          "
+
+      - name: Auto-repair if needed
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            data/products.db
-            data/state_snapshot.json
-          key: jumpshop-db-v3-${{ github.run_id }}
+        run: |
+          if [ ! -f data/jumpshop_state.json ] || ! python -c "import json; json.load(open('data/jumpshop_state.json'))" 2>/dev/null; then
+            echo "State file missing or corrupt, initializing fresh..."
+            mkdir -p data
+            echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/jumpshop_state.json
+            git add data/jumpshop_state.json
+            git config user.email "bot@jumpshop.monitor"
+            git config user.name "Jump Shop Monitor Bot"
+            git commit -m "bot(jumpshop): healthcheck state repair [skip ci]" || true
+            git pull --rebase origin main && git push origin main || echo "Push failed (will retry next run)"
+          fi

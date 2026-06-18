@@ -31,6 +31,9 @@ from common import (
     maybe_send_bot_alert,
     save_state_snapshot, build_snapshot_from_db,
     load_state_snapshot, detect_changes_from_snapshot,
+    load_json_state, save_json_state,
+    detect_all_changes_from_state, detect_lightning_from_state,
+    build_new_state,
 )
 
 running = True
@@ -152,21 +155,26 @@ def fetch_all_products(shop_url, user_agents):
 
 
 def normalize_product(p):
-    variant = p.get("variants", [{}])[0] if p.get("variants") else {}
-    image = p.get("images", [{}])[0] if p.get("images") else {}
+    """安全解析商品数据，处理缺失/异常字段"""
+    variant = (p.get("variants") or [{}])[0]
+    if not isinstance(variant, dict):
+        variant = {}
+    image = (p.get("images") or [{}])[0]
+    if not isinstance(image, dict):
+        image = {}
     return {
-        "id": p["id"],
-        "title": p["title"],
-        "handle": p["handle"],
+        "id": p.get("id", 0),
+        "title": p.get("title", ""),
+        "handle": p.get("handle", ""),
         "vendor": p.get("vendor", ""),
-        "tags": ",".join(p.get("tags", [])),
-        "price": int(float(variant.get("price", 0))),
+        "tags": ",".join(p.get("tags") or []),
+        "price": int(float(variant.get("price", 0) or 0)),
         "available": 1 if variant.get("available") else 0,
-        "sku": variant.get("sku", ""),
-        "image_url": image.get("src", ""),
-        "url": f"https://jumpshop-benelic.com/products/{p['handle']}",
-        "published_at": p.get("published_at", ""),
-        "updated_at": p.get("updated_at", ""),
+        "sku": variant.get("sku", "") or "",
+        "image_url": image.get("src", "") or "",
+        "url": f"https://jumpshop-benelic.com/products/{p.get('handle', '')}",
+        "published_at": p.get("published_at", "") or "",
+        "updated_at": p.get("updated_at", "") or "",
     }
 
 # ---------------------------------------------------------------------------
@@ -343,7 +351,53 @@ def send_notifications(cfg, conn, changes, now_str):
 # ---------------------------------------------------------------------------
 # 单次检查
 # ---------------------------------------------------------------------------
-def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
+def _dispatch_notifications(cfg, conn, changes, now_str, is_first_run, silent):
+    """统一的变更通知分发逻辑 (JSON State / DB 模式共用)"""
+    if not changes:
+        return
+
+    logging.info(f"Detected {len(changes)} changes")
+    for c in changes[:10]:
+        p = c["product"]
+        label = CHANGE_LABELS[c['change_type']]
+        if c.get("lightning"):
+            label += " ⚡"
+        logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
+    if len(changes) > 10:
+        logging.info(f"  ... and {len(changes)-10} more")
+
+    # 熔断: 上新数超过阈值
+    new_count = sum(1 for c in changes if c["change_type"] == "new")
+    fuse_threshold = cfg["monitor_options"].get("new_product_fuse_threshold", 150)
+    if new_count > fuse_threshold:
+        logging.warning(
+            f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}"
+        )
+        if not silent and (not is_first_run or cfg["monitor_options"].get("notify_on_first_run")):
+            summary_text = (
+                f"JUMP SHOP 異常検知\n\n"
+                f"新商品数 {new_count} 件が闾値 {fuse_threshold} を超えました。\n"
+                f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
+                f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
+                f"售羄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
+                f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
+                f"{now_str} | Jump Shop Monitor"
+            )
+            feishu_cfg = cfg["notifications"].get("feishu", {})
+            if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
+                send_feishu_card(
+                    feishu_cfg["webhook_url"],
+                    {"msg_type": "text", "content": {"text": summary_text}},
+                )
+    elif silent:
+        logging.info("Silent mode - skipping notifications")
+    elif is_first_run and not cfg["monitor_options"].get("notify_on_first_run"):
+        logging.info("First run - skipping notifications")
+    else:
+        send_notifications(cfg, conn, changes, now_str)
+
+
+def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None, state_file=None):
     start = time.time()
     logging.info("Checking Jump Shop...")
 
@@ -355,7 +409,76 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
     products = [normalize_product(p) for p in products_raw]
     now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
 
-    # 灾难恢复: 自愈/缓存故障后，用旧快照对比当前API数据，补上遗漏事件
+    # ---- 产品数异常检测 (API返回部分数据会导致假上新) ----
+    min_expected = cfg["monitor_options"].get("min_product_count", 100)
+    if len(products) < min_expected:
+        logging.error(
+            "PRODUCT COUNT ANOMALY: got %d products, expected >= %d. "
+            "API may be returning partial data — skipping this cycle.",
+            len(products), min_expected
+        )
+        return 0
+
+    # ---- JSON State 模式 (主路径, Git持久化, 可靠) ----
+    if state_file:
+        old_state = load_json_state(state_file)
+        first_run = len(old_state.get("products", {})) == 0
+
+        if first_run:
+            logging.info("First run with JSON state - building baseline...")
+
+        # 产品数突变检测
+        old_total = old_state.get("total_products", 0)
+        if old_total > 0:
+            ratio = len(products) / old_total
+            if ratio < 0.5 or ratio > 1.5:
+                logging.warning(
+                    "PRODUCT COUNT DRIFT: %d → %d (%.0f%%). "
+                    "Possible API issue or massive inventory change.",
+                    old_total, len(products), ratio * 100
+                )
+
+        # 变更检测 (new/restock/sold_out/price_change + soldout_delta 一次完成)
+        changes, soldout_ids = detect_all_changes_from_state(old_state, products, now_str, cfg)
+
+        # 闪电售罄检测
+        lightning_threshold = cfg["monitor_options"].get("lightning_sellout_threshold_seconds", 300)
+        detect_lightning_from_state(old_state, changes, now_str, lightning_threshold)
+
+        # 构建并保存新状态
+        new_products = build_new_state(products, old_state, now_str)
+        new_state = {
+            "version": 2,
+            "updated_at": now_str,
+            "total_products": len(products),
+            "soldout_ids": soldout_ids,
+            "products": new_products,
+        }
+
+        _dispatch_notifications(cfg, conn, changes, now_str,
+                                is_first_run=first_run, silent=silent)
+
+        # 记录变更到 DB (如果能写的话, 供 analysis.py 使用)
+        if changes and conn:
+            try:
+                log_changes(conn, changes, now_str)
+            except Exception as e:
+                logging.warning("Failed to log changes to DB: %s", e)
+
+        save_json_state(new_state, state_file)
+
+        # 同步 DB (可选, 供本地 analysis.py)
+        if conn:
+            try:
+                update_db(conn, products, now_str)
+            except Exception as e:
+                logging.warning("Failed to update DB: %s", e)
+
+        elapsed = time.time() - start
+        logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked (JSON state)")
+        return len(changes)
+
+    # ---- DB 模式 (向后兼容, 本地开发/旧workflow) ----
     recovered_changes = []
     if recover_from:
         old_snapshot = load_state_snapshot(recover_from)
@@ -365,11 +488,9 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
 
     changes, _ = detect_changes(conn, products, cfg)
 
-    # 快照对比: 补充 per-product 检测可能漏掉的售罄/補貨
     detect_sold_out = cfg["monitor_options"].get("detect_sold_out", True)
     snapshot_changes = detect_soldout_delta(conn, products, detect_sold_out, now_str)
 
-    # 合并: per-product > snapshot > recovered (去重)
     existing_ids = {c["product_id"]: c for c in changes}
     for sc in snapshot_changes:
         if sc["product_id"] not in existing_ids:
@@ -379,63 +500,27 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         if rc["product_id"] not in existing_ids:
             changes.append(rc)
 
-    # 闪电售罄检测: 分析售罄商品的实际耗时
     lightning_threshold = cfg["monitor_options"].get("lightning_sellout_threshold_seconds", 300)
     detect_lightning_sellouts(conn, changes, now_str, lightning_threshold, publish_field="published_at")
 
-    # 通知策略: 恢复模式下仅发送从快照恢复的变更，避免"全量上新"轰炸
-    if changes:
-        logging.info(f"Detected {len(changes)} changes")
-        for c in changes[:10]:
-            p = c["product"]
-            label = CHANGE_LABELS[c['change_type']]
-            if c.get("lightning"):
-                label += " ⚡"
-            logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
-        if len(changes) > 10:
-            logging.info(f"  ... and {len(changes)-10} more")
-
-        # 熔断: 上新数超过阈值 → 判定为缓存异常，降级为纯文本摘要
-        new_count = sum(1 for c in changes if c["change_type"] == "new")
-        fuse_threshold = cfg["monitor_options"].get("new_product_fuse_threshold", 150)
-        if new_count > fuse_threshold:
-            logging.warning(
-                f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}. "
-                "Likely cache corruption — sending summary only."
-            )
-            # 只发一条文本摘要，不发卡片轰炸
-            if not silent and (not is_first_run or cfg["monitor_options"].get("notify_on_first_run")):
-                summary_text = (
-                    f"JUMP SHOP 異常検知\n\n"
-                    f"新商品数 {new_count} 件が閾値 {fuse_threshold} を超えました。\n"
-                    f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
-                    f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
-                    f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
-                    f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
-                    f"{now_str} | Jump Shop Monitor"
-                )
-                feishu_cfg = cfg["notifications"].get("feishu", {})
-                if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
-                    send_feishu_card(
-                        feishu_cfg["webhook_url"],
-                        {"msg_type": "text", "content": {"text": summary_text}},
-                    )
-        elif silent:
-            logging.info("Silent mode - skipping notifications")
-        elif is_first_run and recovered_changes and not cfg["monitor_options"].get("notify_on_first_run"):
-            notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
-            logging.info(f"Recovery mode: sending {len(notify_changes)}/{len(changes)} recovered changes")
-            if notify_changes:
-                send_notifications(cfg, conn, notify_changes, now_str)
-        elif not is_first_run or cfg["monitor_options"].get("notify_on_first_run"):
-            send_notifications(cfg, conn, changes, now_str)
-        log_changes(conn, changes, now_str)
+    # 恢复模式下仅发从快照恢复的变更
+    notify_is_first = is_first_run and bool(recovered_changes) and not cfg["monitor_options"].get("notify_on_first_run")
+    if notify_is_first:
+        notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
+        logging.info(f"Recovery mode: sending {len(notify_changes)}/{len(changes)} recovered changes")
+        _dispatch_notifications(cfg, conn, notify_changes, now_str,
+                                is_first_run=False, silent=silent)
     else:
-        logging.info("No changes")
+        _dispatch_notifications(cfg, conn, changes, now_str,
+                                is_first_run=is_first_run and not recovered_changes,
+                                silent=silent)
+
+    if changes:
+        log_changes(conn, changes, now_str)
 
     update_db(conn, products, now_str)
 
-    # 每次成功运行后保存状态快照，用于灾难恢复
+    # 状态快照备份 (灾难恢复用)
     snapshot_path = cfg.get("state_snapshot_path", "data/state_snapshot.json")
     try:
         snapshot_data = build_snapshot_from_db(conn)
@@ -444,7 +529,7 @@ def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None):
         logging.warning(f"Failed to save state snapshot: {e}")
 
     elapsed = time.time() - start
-    logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked")
+    logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked (DB mode)")
     return len(changes)
 
 # ---------------------------------------------------------------------------
@@ -459,20 +544,28 @@ def main():
     global running
     cfg = load_config()
     setup_logging(cfg["log_file"])
-    conn = init_db(cfg["database_path"])
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    cur = conn.execute("SELECT COUNT(*) FROM products")
-    is_first_run = cur.fetchone()[0] == 0
-
-    if is_first_run:
-        logging.info("First run - building baseline database...")
-
+    # 解析命令行参数
     once = "--once" in sys.argv
     silent = "--silent" in sys.argv
 
+    # --state-file=<path>: JSON State 模式 (Git 持久化)
+    state_file = None
+    for arg in sys.argv:
+        if arg.startswith("--state-file="):
+            state_file = arg.split("=", 1)[1]
+        elif arg == "--state-file" and sys.argv.index(arg) + 1 < len(sys.argv):
+            state_file = sys.argv[sys.argv.index(arg) + 1]
+
+    # --db=<path>: 可选 DB (仅用于 change_log, 不影响变更检测)
+    db_path = None
+    for arg in sys.argv:
+        if arg.startswith("--db="):
+            db_path = arg.split("=", 1)[1]
+        elif arg == "--db" and sys.argv.index(arg) + 1 < len(sys.argv):
+            db_path = sys.argv[sys.argv.index(arg) + 1]
+
+    # --recover-from=<path>: 灾难恢复 (仅 DB 模式)
     recover_from = None
     for arg in sys.argv:
         if arg.startswith("--recover-from="):
@@ -480,9 +573,47 @@ def main():
         elif arg == "--recover-from" and sys.argv.index(arg) + 1 < len(sys.argv):
             recover_from = sys.argv[sys.argv.index(arg) + 1]
 
+    # 初始化 DB (change_log + 向后兼容)
+    conn = None
+    if state_file:
+        # JSON State 模式: DB 可选, 仅用于 change_log
+        if db_path:
+            try:
+                conn = init_db(db_path)
+            except Exception as e:
+                logging.warning("DB init failed, change_log disabled: %s", e)
+        else:
+            default_db = cfg.get("database_path", "data/products.db")
+            try:
+                conn = init_db(default_db)
+            except Exception as e:
+                logging.warning("DB init failed (non-fatal in state-file mode): %s", e)
+    else:
+        # DB 模式: DB 必须可用
+        conn = init_db(cfg["database_path"])
+
+    # 判断是否首次运行
+    is_first_run = False
+    if conn:
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM products")
+            is_first_run = cur.fetchone()[0] == 0
+        except Exception:
+            is_first_run = True
+    elif state_file:
+        is_first_run = not Path(state_file).exists()
+
+    if is_first_run:
+        logging.info("First run - building baseline...")
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     if once:
-        run_once(cfg, conn, is_first_run=is_first_run, silent=silent, recover_from=recover_from)
-        conn.close()
+        run_once(cfg, conn, is_first_run=is_first_run, silent=silent,
+                 recover_from=recover_from, state_file=state_file)
+        if conn:
+            conn.close()
         return
 
     interval = cfg.get("poll_interval_seconds", 300)
@@ -490,9 +621,15 @@ def main():
 
     while running:
         try:
-            run_once(cfg, conn, is_first_run=is_first_run, silent=silent, recover_from=recover_from)
+            run_once(cfg, conn, is_first_run=is_first_run, silent=silent,
+                     recover_from=recover_from, state_file=state_file)
             is_first_run = False
-            recover_from = None  # only recover on first iteration
+            recover_from = None
+        except KeyboardInterrupt:
+            logging.info("Keyboard interrupt received")
+            break
+        except SystemExit:
+            break
         except Exception as e:
             logging.error(f"Run failed: {e}", exc_info=True)
 
@@ -507,7 +644,8 @@ def main():
                 break
             time.sleep(1)
 
-    conn.close()
+    if conn:
+        conn.close()
     logging.info("Monitor stopped")
 
 if __name__ == "__main__":

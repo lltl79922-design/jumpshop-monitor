@@ -2,6 +2,7 @@
 """Jump Shop + ufotable WEBSHOP 监控共享模块 — 飞书API、售罄快照、通知卡片"""
 
 import json
+import os
 import time
 import logging
 from pathlib import Path
@@ -744,3 +745,220 @@ def detect_changes_from_snapshot(old_snapshot, products, cfg):
             })
 
     return changes
+
+
+# =============================================================================
+# JSON 状态持久化 (v2) — 替代 SQLite 做变更检测，杜绝缓存损坏导致的误报
+# =============================================================================
+
+def load_json_state(filepath):
+    """加载 JSON 状态文件。不存在或损坏时返回空状态。"""
+    if not Path(filepath).exists():
+        return {"version": 2, "products": {}, "soldout_ids": [], "updated_at": ""}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logging.warning("JSON state file corrupted, starting fresh: %s", e)
+        return {"version": 2, "products": {}, "soldout_ids": [], "updated_at": ""}
+
+    # 兼容旧格式 (v1: 纯 product dict, 无 soldout_ids)
+    if "version" not in state:
+        state = {"version": 2, "products": state, "soldout_ids": [],
+                 "updated_at": state.get("updated_at", "") if isinstance(state, dict) else ""}
+    if "soldout_ids" not in state:
+        state["soldout_ids"] = []
+    if "products" not in state:
+        state["products"] = {}
+    return state
+
+
+def save_json_state(state, filepath):
+    """保存 JSON 状态文件（原子写入：先写临时文件再 rename）"""
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    state["version"] = 2
+    tmp = filepath + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, filepath)
+    logging.info("JSON state saved: %d products, %d soldout_ids",
+                 len(state.get("products", {})), len(state.get("soldout_ids", [])))
+
+
+def _product_entry(p):
+    """从 normalize 后的 product dict 提取状态条目"""
+    return {
+        "title": p.get("title", ""),
+        "available": p.get("available", 0),
+        "price": p.get("price", 0),
+        "image_url": p.get("image_url", ""),
+        "url": p.get("url", ""),
+        "vendor": p.get("vendor", p.get("works", "")),
+        "handle": p.get("handle", p.get("product_code", "")),
+        "published_at": p.get("published_at", p.get("valid_after", "")),
+        "first_seen": "",
+        "last_available_at": "",
+    }
+
+
+def detect_all_changes_from_state(old_state, products, now_str, cfg):
+    """从 JSON 状态检测所有变更 (new/restock/sold_out/price_change + soldout_delta)。
+    一次性替代 detect_changes() + detect_soldout_delta()。
+
+    返回: (changes, current_soldout_ids)
+    """
+    monitor_opts = cfg.get("monitor_options", {})
+    old_products = old_state.get("products", {})
+    old_soldout = set(old_state.get("soldout_ids", []))
+
+    changes = []
+    existing_ids = set()   # 用于 soldout_delta 去重
+    current_soldout = set()
+    product_map = {}
+
+    for p in products:
+        pid = str(p["id"])
+        product_map[pid] = p
+        if p["available"] == 0:
+            current_soldout.add(pid)
+
+        old = old_products.get(pid)
+
+        if old is None:
+            if monitor_opts.get("detect_new_products", True):
+                changes.append({
+                    "product_id": int(pid), "change_type": "new",
+                    "old_value": None,
+                    "new_value": f"{p['title']} | Y{p['price']} | {'in stock' if p['available'] else 'out of stock'}",
+                    "product": p,
+                })
+                existing_ids.add(pid)
+        else:
+            if monitor_opts.get("detect_restocks", True) and old["available"] == 0 and p["available"] == 1:
+                changes.append({
+                    "product_id": int(pid), "change_type": "restock",
+                    "old_value": "out of stock", "new_value": "in stock",
+                    "product": p,
+                })
+                existing_ids.add(pid)
+            if monitor_opts.get("detect_sold_out", True) and old["available"] == 1 and p["available"] == 0:
+                changes.append({
+                    "product_id": int(pid), "change_type": "sold_out",
+                    "old_value": "in stock", "new_value": "out of stock",
+                    "product": p,
+                })
+                existing_ids.add(pid)
+            if monitor_opts.get("detect_price_changes", True) and old["price"] != p["price"] and old["price"] != 0:
+                changes.append({
+                    "product_id": int(pid), "change_type": "price_change",
+                    "old_value": f"Y{old['price']}", "new_value": f"Y{p['price']}",
+                    "product": p,
+                })
+                existing_ids.add(pid)
+
+    # Soldout delta 快照对比 (补充 per-product 检测的遗漏)
+    if monitor_opts.get("detect_sold_out", True):
+        newly_soldout = current_soldout - old_soldout
+        newly_restocked = old_soldout - current_soldout
+
+        for pid_str in newly_soldout:
+            if pid_str not in existing_ids:
+                p = product_map.get(pid_str)
+                if p:
+                    changes.append({
+                        "product_id": int(pid_str), "change_type": "sold_out",
+                        "old_value": "in stock", "new_value": "sold out (snapshot)",
+                        "product": p,
+                    })
+
+        for pid_str in newly_restocked:
+            if pid_str not in existing_ids:
+                p = product_map.get(pid_str)
+                if p:
+                    changes.append({
+                        "product_id": int(pid_str), "change_type": "restock",
+                        "old_value": "sold out", "new_value": "in stock (snapshot)",
+                        "product": p,
+                    })
+
+    return changes, sorted(current_soldout)
+
+
+def detect_lightning_from_state(old_state, changes, now_str, threshold_seconds=300):
+    """从 JSON 状态检测闪电售罄（不依赖 DB）"""
+    if threshold_seconds <= 0:
+        return
+
+    now_dt = parse_timestamp(now_str)
+    if not now_dt:
+        return
+
+    old_products = old_state.get("products", {})
+    lightning_count = 0
+
+    for c in changes:
+        if c["change_type"] != "sold_out":
+            continue
+
+        pid = str(c["product_id"])
+        old = old_products.get(pid, {})
+
+        sellout_seconds = None
+        source = None
+
+        for src_label, field in [
+            ("last_available", old.get("last_available_at", "")),
+            ("published", old.get("published_at", "")),
+            ("first_seen", old.get("first_seen", "")),
+        ]:
+            if not field:
+                continue
+            ref_dt = parse_timestamp(field)
+            if ref_dt:
+                delta = (now_dt - ref_dt).total_seconds()
+                if 0 <= delta:
+                    sellout_seconds = delta
+                    source = src_label
+                    break
+
+        if sellout_seconds is not None and sellout_seconds <= threshold_seconds:
+            c["lightning"] = {
+                "sellout_seconds": int(sellout_seconds),
+                "source": source,
+                "display": format_duration(int(sellout_seconds)),
+            }
+            lightning_count += 1
+            logging.info(
+                "  ⚡ Lightning sellout: %s | %s | source=%s",
+                c["product"].get("title", str(pid))[:50],
+                format_duration(int(sellout_seconds)),
+                source
+            )
+
+    if lightning_count:
+        logging.info("Lightning sellout summary: %d/%d sold_out items", lightning_count,
+                     sum(1 for c in changes if c["change_type"] == "sold_out"))
+
+
+def build_new_state(products, old_state, now_str):
+    """从当前 API 数据 + 旧状态构建新 JSON 状态 products 字典"""
+    old_products = old_state.get("products", {})
+    new_products = {}
+
+    for p in products:
+        pid = str(p["id"])
+        old = old_products.get(pid, {})
+        entry = _product_entry(p)
+
+        # 保留 first_seen
+        entry["first_seen"] = old.get("first_seen", "") or now_str
+
+        # 更新 last_available_at: 有货→记录当前时间, 无货→保留旧值
+        if p["available"] == 1:
+            entry["last_available_at"] = now_str
+        else:
+            entry["last_available_at"] = old.get("last_available_at", "")
+
+        new_products[pid] = entry
+
+    return new_products
