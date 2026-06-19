@@ -64,12 +64,21 @@ jobs:
               return 0
             fi
             git commit -m "bot(ufotable): state $label [skip ci]" || return 1
+            # Pull with rebase — detect and recover from conflicts
+            REBASE_OUT=$(git pull --rebase origin main 2>&1)
+            REBASE_RC=$?
+            if [ $REBASE_RC -ne 0 ]; then
+              echo "  [push_state:$label] REBASE CONFLICT — aborting and restoring local state"
+              git rebase --abort 2>/dev/null || true
+              echo "  [push_state:$label] rebase aborted, will retry push"
+            fi
             for i in 1 2 3; do
-              if git pull --rebase origin main 2>/dev/null && git push origin main 2>/dev/null; then
+              if git push origin main 2>&1; then
                 echo "  [push_state:$label] OK"
                 return 0
               fi
               echo "  [push_state:$label] retry $i/3..."
+              git pull --rebase origin main 2>/dev/null || git rebase --abort 2>/dev/null || true
               sleep 3
             done
             echo "  [push_state:$label] FAILED (non-fatal)"

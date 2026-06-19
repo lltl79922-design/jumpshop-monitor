@@ -1,117 +1,168 @@
 #!/usr/bin/env python3
 """
-Jump Shop 持续监控版本 - 商品上新+补货通知 (飞书卡片+图片预览)
-用法: python monitor_loop.py
-      python monitor_loop.py --once --state-file=data/jumpshop_state.json --db=data/products.db
+Jump Shop 持续监控 — 商品上新+补货通知 (飞书卡片+图片预览)
+用法:
+  python monitor_loop.py --once --state-file=data/jumpshop_state.json --db=data/products.db
+  python monitor_loop.py                          # 本地持续模式 (DB 模式)
 Ctrl+C 停止
 """
 
 import json
 import os
-import sqlite3
-import smtplib
-import time
-import signal
 import sys
+import time
 import random
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
 from common import (
-    JST, CHANGE_LABELS,
+    JST,
     setup_logging, log_changes,
     ensure_image_keys,
-    detect_soldout_delta, detect_lightning_sellouts,
     build_feishu_cards, send_feishu_card,
     maybe_send_bot_alert,
-    save_state_snapshot, build_snapshot_from_db,
-    load_state_snapshot, detect_changes_from_snapshot,
     load_json_state, save_json_state,
     detect_all_changes_from_state, detect_lightning_from_state,
-    build_new_state,
+    build_new_state, validate_state_integrity,
+    ShopConfig, MonitorRunner,
 )
 
-running = True
+# ---------------------------------------------------------------------------
+# Jump Shop Runner
+# ---------------------------------------------------------------------------
 
-JUMP_SHOP_CARD = {
-    "name": "JUMP SHOP",
-    "template_color": "red",
-    "footer": "Jump Shop Monitor",
-    "subtitle_field": "vendor",
-}
+JUMP_SHOP = ShopConfig(
+    name="JUMP SHOP",
+    template_color="red",
+    footer="Jump Shop Monitor",
+    subtitle_field="vendor",
+    shop_url="https://jumpshop-benelic.com",
+    config_path="config.json",
+    config_example_path="config.example.json",
+    db_path_default="data/products.db",
+    state_file_default="data/jumpshop_state.json",
+    min_product_count=100,
+)
+
+
+class JumpShopRunner(MonitorRunner):
+    """Jump Shop 监控运行器"""
+
+    # ---- Config (Jump Shop 特有加载逻辑) ----
+
+    def load_config(self, path="config.json"):
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        # 注入环境变量
+        if os.environ.get("FEISHU_WEBHOOK_URL"):
+            cfg["notifications"]["feishu"]["webhook_url"] = os.environ["FEISHU_WEBHOOK_URL"]
+        if os.environ.get("FEISHU_APP_ID"):
+            cfg["notifications"]["feishu"]["app_id"] = os.environ["FEISHU_APP_ID"]
+        if os.environ.get("FEISHU_APP_SECRET"):
+            cfg["notifications"]["feishu"]["app_secret"] = os.environ["FEISHU_APP_SECRET"]
+        return cfg
+
+    # ---- DB (Jump Shop 表结构) ----
+
+    def init_db(self, db_path):
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY,
+                title TEXT, handle TEXT, vendor TEXT, tags TEXT,
+                price INTEGER, available INTEGER, sku TEXT,
+                image_url TEXT, url TEXT,
+                published_at TEXT, updated_at TEXT,
+                first_seen TEXT, last_checked TEXT,
+                feishu_img_key TEXT DEFAULT ''
+            )
+        """)
+        # 兼容性迁移
+        try:
+            conn.execute("SELECT feishu_img_key FROM products LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE products ADD COLUMN feishu_img_key TEXT DEFAULT ''")
+        try:
+            conn.execute("SELECT last_available_at FROM products LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE products ADD COLUMN last_available_at TEXT DEFAULT ''")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER, change_type TEXT,
+                old_value TEXT, new_value TEXT,
+                detected_at TEXT, notified INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS soldout_snapshot (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                soldout_ids TEXT DEFAULT '[]',
+                updated_at TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at)
+            VALUES (1, '[]', '')
+        """)
+        conn.commit()
+        return conn
+
+    def update_db(self, conn, products, now_str):
+        for p in products:
+            conn.execute("""
+                INSERT INTO products (id, title, handle, vendor, tags, price,
+                    available, sku, image_url, url, published_at, updated_at,
+                    first_seen, last_checked, last_available_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title, handle=excluded.handle,
+                    vendor=excluded.vendor, tags=excluded.tags,
+                    price=excluded.price, available=excluded.available,
+                    sku=excluded.sku, image_url=excluded.image_url,
+                    url=excluded.url, published_at=excluded.published_at,
+                    updated_at=excluded.updated_at,
+                    last_checked=excluded.last_checked,
+                    last_available_at=CASE
+                        WHEN excluded.available = 1 THEN excluded.last_checked
+                        ELSE products.last_available_at
+                    END
+            """, (p["id"], p["title"], p["handle"], p["vendor"], p["tags"],
+                  p["price"], p["available"], p["sku"], p["image_url"],
+                  p["url"], p["published_at"], p["updated_at"],
+                  now_str, now_str, now_str))
+        conn.commit()
+
+    # ---- 商品拉取 ----
+
+    def fetch_products(self, cfg):
+        raw = fetch_all_products(cfg["shop_url"], cfg["user_agents"])
+        return [normalize_product(p) for p in raw]
+
+    # ---- 通知 (含企业微信 + 邮件) ----
+
+    def _send_all_notifications(self, cfg, conn, changes, now_str):
+        # 飞书 (基类处理)
+        super()._send_all_notifications(cfg, conn, changes, now_str)
+        # 企业微信
+        nc = cfg.get("notifications", {})
+        if nc.get("wechat_work", {}).get("enabled"):
+            _send_wechat_work(nc["wechat_work"]["webhook_url"], changes, now_str)
+        # 邮件
+        if nc.get("email", {}).get("enabled"):
+            _send_email(nc["email"], changes, now_str)
+
 
 # ---------------------------------------------------------------------------
-# 配置
+# Jump Shop API
 # ---------------------------------------------------------------------------
-def load_config(path="config.json"):
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
 
-    if os.environ.get("FEISHU_WEBHOOK_URL"):
-        cfg["notifications"]["feishu"]["webhook_url"] = os.environ["FEISHU_WEBHOOK_URL"]
-    if os.environ.get("FEISHU_APP_ID"):
-        cfg["notifications"]["feishu"]["app_id"] = os.environ["FEISHU_APP_ID"]
-    if os.environ.get("FEISHU_APP_SECRET"):
-        cfg["notifications"]["feishu"]["app_secret"] = os.environ["FEISHU_APP_SECRET"]
-
-    return cfg
-
-# ---------------------------------------------------------------------------
-# 数据库
-# ---------------------------------------------------------------------------
-def init_db(db_path):
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY,
-            title TEXT, handle TEXT, vendor TEXT, tags TEXT,
-            price INTEGER, available INTEGER, sku TEXT,
-            image_url TEXT, url TEXT,
-            published_at TEXT, updated_at TEXT,
-            first_seen TEXT, last_checked TEXT,
-            feishu_img_key TEXT DEFAULT ''
-        )
-    """)
-    try:
-        conn.execute("SELECT feishu_img_key FROM products LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE products ADD COLUMN feishu_img_key TEXT DEFAULT ''")
-    try:
-        conn.execute("SELECT last_available_at FROM products LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE products ADD COLUMN last_available_at TEXT DEFAULT ''")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS change_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER, change_type TEXT,
-            old_value TEXT, new_value TEXT,
-            detected_at TEXT, notified INTEGER DEFAULT 0
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS soldout_snapshot (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            soldout_ids TEXT DEFAULT '[]',
-            updated_at TEXT DEFAULT ''
-        )
-    """)
-    conn.execute("""
-        INSERT OR IGNORE INTO soldout_snapshot (id, soldout_ids, updated_at)
-        VALUES (1, '[]', '')
-    """)
-    conn.commit()
-    return conn
-
-# ---------------------------------------------------------------------------
-# 商品拉取
-# ---------------------------------------------------------------------------
 def fetch_all_products(shop_url, user_agents):
     all_products = []
     page = 1
@@ -131,7 +182,7 @@ def fetch_all_products(shop_url, user_agents):
                 resp = requests.get(url, headers=headers, timeout=30)
                 if resp.status_code == 429:
                     wait = int(resp.headers.get("Retry-After", 30))
-                    logging.warning(f"Rate limited, waiting {wait}s...")
+                    logging.warning("Rate limited, waiting %ds...", wait)
                     time.sleep(wait)
                     continue
                 resp.raise_for_status()
@@ -140,7 +191,7 @@ def fetch_all_products(shop_url, user_agents):
                 all_products.extend(products)
                 break
             except Exception as e:
-                logging.warning(f"Page {page} attempt {attempt+1}/3: {e}")
+                logging.warning("Page %d attempt %d/3: %s", page, attempt + 1, e)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                 else:
@@ -155,7 +206,7 @@ def fetch_all_products(shop_url, user_agents):
 
 
 def normalize_product(p):
-    """安全解析商品数据，处理缺失/异常字段"""
+    """安全解析 Jump Shop 商品数据"""
     variant = (p.get("variants") or [{}])[0]
     if not isinstance(variant, dict):
         variant = {}
@@ -177,74 +228,12 @@ def normalize_product(p):
         "updated_at": p.get("updated_at", "") or "",
     }
 
-# ---------------------------------------------------------------------------
-# 变更检测
-# ---------------------------------------------------------------------------
-def detect_changes(conn, products, cfg):
-    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
-    changes = []
-
-    for p in products:
-        pid = p["id"]
-        cur = conn.execute("SELECT price, available, updated_at FROM products WHERE id=?", (pid,))
-        old = cur.fetchone()
-
-        if old is None:
-            if cfg["monitor_options"]["detect_new_products"]:
-                changes.append({
-                    "product_id": pid, "change_type": "new",
-                    "old_value": None,
-                    "new_value": f"{p['title']} | Y{p['price']} | {'in stock' if p['available'] else 'out of stock'}",
-                    "product": p,
-                })
-        else:
-            old_price, old_available, old_updated = old
-            if cfg["monitor_options"]["detect_restocks"] and old_available == 0 and p["available"] == 1:
-                changes.append({
-                    "product_id": pid, "change_type": "restock",
-                    "old_value": "out of stock", "new_value": "in stock", "product": p,
-                })
-            if cfg["monitor_options"]["detect_sold_out"] and old_available == 1 and p["available"] == 0:
-                changes.append({
-                    "product_id": pid, "change_type": "sold_out",
-                    "old_value": "in stock", "new_value": "out of stock", "product": p,
-                })
-            if cfg["monitor_options"]["detect_price_changes"] and old_price != p["price"] and old_price != 0:
-                changes.append({
-                    "product_id": pid, "change_type": "price_change",
-                    "old_value": f"Y{old_price}", "new_value": f"Y{p['price']}", "product": p,
-                })
-
-    return changes, now_str
 
 # ---------------------------------------------------------------------------
-# 数据库更新
+# 额外通知渠道 (Jump Shop 特有)
 # ---------------------------------------------------------------------------
-def update_db(conn, products, now_str):
-    for p in products:
-        conn.execute("""
-            INSERT INTO products (id, title, handle, vendor, tags, price, available, sku, image_url, url, published_at, updated_at, first_seen, last_checked, last_available_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                title=excluded.title, handle=excluded.handle, vendor=excluded.vendor,
-                tags=excluded.tags, price=excluded.price, available=excluded.available,
-                sku=excluded.sku, image_url=excluded.image_url, url=excluded.url,
-                published_at=excluded.published_at, updated_at=excluded.updated_at,
-                last_checked=excluded.last_checked,
-                last_available_at=CASE
-                    WHEN excluded.available = 1 THEN excluded.last_checked
-                    ELSE products.last_available_at
-                END
-        """, (p["id"], p["title"], p["handle"], p["vendor"], p["tags"],
-              p["price"], p["available"], p["sku"], p["image_url"], p["url"],
-              p["published_at"], p["updated_at"], now_str, now_str, now_str))
-    conn.commit()
 
-# ---------------------------------------------------------------------------
-# 通知
-# ---------------------------------------------------------------------------
-def format_text_message(changes, now_str):
-    """纯文本通知(企业微信/邮件等)"""
+def _format_text_message(changes, now_str):
     total = len(changes)
     new_count = sum(1 for c in changes if c["change_type"] == "new")
     restock_count = sum(1 for c in changes if c["change_type"] == "restock")
@@ -253,17 +242,16 @@ def format_text_message(changes, now_str):
 
     lines = [
         f"JUMP SHOP Monitor - {now_str}",
-        f"Changes: {total} (New:{new_count} Restock:{restock_count} SoldOut:{soldout_count} Price:{price_count})",
+        f"Changes: {total} (New:{new_count} Restock:{restock_count} "
+        f"SoldOut:{soldout_count} Price:{price_count})",
         "",
     ]
-
     type_order = [
         ("new", "=== NEW PRODUCTS ==="),
         ("restock", "=== RESTOCKS ==="),
         ("sold_out", "=== SOLD OUT ==="),
         ("price_change", "=== PRICE CHANGES ==="),
     ]
-
     for ctype, header in type_order:
         items = [c for c in changes if c["change_type"] == ctype]
         if not items:
@@ -274,38 +262,33 @@ def format_text_message(changes, now_str):
             status = "[IN STOCK]" if p["available"] else "[SOLD OUT]"
             lines.append(f"  {p['title']}")
             lines.append(f"  {p['url']}")
-            lines.append(f"  Y{p['price']} | {status} | {p.get('vendor','')}")
+            lines.append(f"  Y{p['price']} | {status} | {p.get('vendor', '')}")
             if ctype == "price_change":
                 lines.append(f"  {c['old_value']} -> {c['new_value']}")
         if len(items) > 30:
-            lines.append(f"  ... and {len(items)-30} more")
-
+            lines.append(f"  ... and {len(items) - 30} more")
     return "\n".join(lines)
 
 
-def send_feishu(feishu_cfg, changes, now_str):
-    """飞书交互式卡片通知(含图片预览), 超过50件自动分页"""
-    webhook_url = feishu_cfg["webhook_url"]
-    cards = build_feishu_cards(changes, now_str, JUMP_SHOP_CARD)
-    fallback = "JUMP SHOP Monitor\n\n" + format_text_message(changes, now_str)[:8000]
-    send_feishu_card(webhook_url, cards, fallback)
-
-
-def send_wechat_work(webhook_url, changes, now_str):
-    text = format_text_message(changes, now_str)
+def _send_wechat_work(webhook_url, changes, now_str):
+    text = _format_text_message(changes, now_str)
     payload = {"msgtype": "text", "text": {"content": text[:4000]}}
     try:
         resp = requests.post(webhook_url, json=payload, timeout=15)
         if resp.json().get("errcode") == 0:
             logging.info("WeChat Work notification sent")
         else:
-            logging.error(f"WeChat Work error: {resp.json()}")
+            logging.error("WeChat Work error: %s", resp.json())
     except Exception as e:
-        logging.error(f"WeChat Work send failed: {e}")
+        logging.error("WeChat Work send failed: %s", e)
 
 
-def send_email(smtp_config, changes, now_str):
-    text = format_text_message(changes, now_str)
+def _send_email(smtp_config, changes, now_str):
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    text = _format_text_message(changes, now_str)
     html = text.replace("\n", "<br>")
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"JUMP SHOP Monitor - {now_str}"
@@ -314,247 +297,29 @@ def send_email(smtp_config, changes, now_str):
     msg.attach(MIMEText(text, "plain", "utf-8"))
     msg.attach(MIMEText(f"<pre>{html}</pre>", "html", "utf-8"))
     try:
-        with smtplib.SMTP(smtp_config["smtp_host"], smtp_config["smtp_port"], timeout=15) as server:
+        with smtplib.SMTP(smtp_config["smtp_host"], smtp_config["smtp_port"],
+                          timeout=15) as server:
             server.starttls()
             server.login(smtp_config["smtp_user"], smtp_config["smtp_pass"])
-            server.sendmail(smtp_config["smtp_user"], smtp_config["to_emails"], msg.as_string())
+            server.sendmail(smtp_config["smtp_user"],
+                           smtp_config["to_emails"], msg.as_string())
         logging.info("Email sent")
     except Exception as e:
-        logging.error(f"Email send failed: {e}")
+        logging.error("Email send failed: %s", e)
 
-
-def send_notifications(cfg, conn, changes, now_str):
-    if not changes:
-        return
-    nc = cfg["notifications"]
-
-    if nc.get("feishu", {}).get("enabled"):
-        feishu_cfg = nc["feishu"]
-        if feishu_cfg.get("image_preview") and feishu_cfg.get("app_id"):
-            ensure_image_keys(conn, changes, feishu_cfg)
-        send_feishu(feishu_cfg, changes, now_str)
-
-        # Bot 扫货预警: 闪电售罄数量达到阈值时发送独立红色报警卡片
-        mo = cfg.get("monitor_options", {})
-        if mo.get("bot_alert_enabled", True):
-            bot_min = mo.get("bot_alert_min_count", 3)
-            maybe_send_bot_alert(
-                feishu_cfg["webhook_url"], changes, now_str,
-                JUMP_SHOP_CARD, min_count=bot_min
-            )
-
-    if nc.get("wechat_work", {}).get("enabled"):
-        send_wechat_work(nc["wechat_work"]["webhook_url"], changes, now_str)
-    if nc.get("email", {}).get("enabled"):
-        send_email(nc["email"], changes, now_str)
 
 # ---------------------------------------------------------------------------
-# 单次检查
+# CLI 入口
 # ---------------------------------------------------------------------------
-def _dispatch_notifications(cfg, conn, changes, now_str, is_first_run, silent):
-    """统一的变更通知分发逻辑 (JSON State / DB 模式共用)"""
-    if not changes:
-        return
-
-    logging.info(f"Detected {len(changes)} changes")
-    for c in changes[:10]:
-        p = c["product"]
-        label = CHANGE_LABELS[c['change_type']]
-        if c.get("lightning"):
-            label += " ⚡"
-        logging.info(f"  {label} {p['title'][:60]} | Y{p['price']}")
-    if len(changes) > 10:
-        logging.info(f"  ... and {len(changes)-10} more")
-
-    # 首次运行静默建基线 — 不发任何通知(包括断路器摘要)
-    if is_first_run and not cfg["monitor_options"].get("notify_on_first_run"):
-        logging.info("First run - skipping all notifications (baseline build)")
-        return
-
-    if silent:
-        logging.info("Silent mode - skipping notifications")
-        return
-
-    # 熔断: 非首次运行时上新数>阈值 → 状态文件可能丢失/损坏
-    new_count = sum(1 for c in changes if c["change_type"] == "new")
-    fuse_threshold = cfg["monitor_options"].get("new_product_fuse_threshold", 150)
-    if new_count > fuse_threshold:
-        logging.warning(
-            f"CIRCUIT BREAKER: {new_count} new products exceeds threshold {fuse_threshold}"
-        )
-        summary_text = (
-            f"JUMP SHOP 異常検知\n\n"
-            f"新商品数 {new_count} 件が闘値 {fuse_threshold} を超えました。\n"
-            f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
-            f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
-            f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
-            f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
-            f"{now_str} | Jump Shop Monitor"
-        )
-        feishu_cfg = cfg["notifications"].get("feishu", {})
-        if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
-            send_feishu_card(
-                feishu_cfg["webhook_url"],
-                {"msg_type": "text", "content": {"text": summary_text}},
-            )
-        return
-
-    send_notifications(cfg, conn, changes, now_str)
-
-
-def run_once(cfg, conn, is_first_run=False, silent=False, recover_from=None, state_file=None):
-    start = time.time()
-    logging.info("Checking Jump Shop...")
-
-    products_raw = fetch_all_products(cfg["shop_url"], cfg["user_agents"])
-    if not products_raw:
-        logging.error("Failed to fetch products")
-        return 0
-
-    products = [normalize_product(p) for p in products_raw]
-    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
-
-    # ---- 产品数异常检测 (API返回部分数据会导致假上新) ----
-    min_expected = cfg["monitor_options"].get("min_product_count", 100)
-    if len(products) < min_expected:
-        logging.error(
-            "PRODUCT COUNT ANOMALY: got %d products, expected >= %d. "
-            "API may be returning partial data — skipping this cycle.",
-            len(products), min_expected
-        )
-        return 0
-
-    # ---- JSON State 模式 (主路径, Git持久化, 可靠) ----
-    if state_file:
-        old_state = load_json_state(state_file)
-        first_run = len(old_state.get("products", {})) == 0
-
-        if first_run:
-            logging.info("First run with JSON state - building baseline...")
-
-        # 产品数突变检测
-        old_total = old_state.get("total_products", 0)
-        if old_total > 0:
-            ratio = len(products) / old_total
-            if ratio < 0.5 or ratio > 1.5:
-                logging.warning(
-                    "PRODUCT COUNT DRIFT: %d → %d (%.0f%%). "
-                    "Possible API issue or massive inventory change.",
-                    old_total, len(products), ratio * 100
-                )
-
-        # 变更检测 (new/restock/sold_out/price_change + soldout_delta 一次完成)
-        changes, soldout_ids = detect_all_changes_from_state(old_state, products, now_str, cfg)
-
-        # 闪电售罄检测
-        lightning_threshold = cfg["monitor_options"].get("lightning_sellout_threshold_seconds", 300)
-        detect_lightning_from_state(old_state, changes, now_str, lightning_threshold)
-
-        # 构建并保存新状态
-        new_products = build_new_state(products, old_state, now_str)
-        new_state = {
-            "version": 2,
-            "updated_at": now_str,
-            "total_products": len(products),
-            "soldout_ids": soldout_ids,
-            "products": new_products,
-        }
-
-        _dispatch_notifications(cfg, conn, changes, now_str,
-                                is_first_run=first_run, silent=silent)
-
-        # 记录变更到 DB (如果能写的话, 供 analysis.py 使用)
-        if changes and conn:
-            try:
-                log_changes(conn, changes, now_str)
-            except Exception as e:
-                logging.warning("Failed to log changes to DB: %s", e)
-
-        save_json_state(new_state, state_file)
-
-        # 同步 DB (可选, 供本地 analysis.py)
-        if conn:
-            try:
-                update_db(conn, products, now_str)
-            except Exception as e:
-                logging.warning("Failed to update DB: %s", e)
-
-        elapsed = time.time() - start
-        logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked (JSON state)")
-        return len(changes)
-
-    # ---- DB 模式 (向后兼容, 本地开发/旧workflow) ----
-    recovered_changes = []
-    if recover_from:
-        old_snapshot = load_state_snapshot(recover_from)
-        if old_snapshot:
-            recovered_changes = detect_changes_from_snapshot(old_snapshot, products, cfg)
-            logging.info(f"Recovered {len(recovered_changes)} changes from snapshot ({len(old_snapshot)} old products)")
-
-    changes, _ = detect_changes(conn, products, cfg)
-
-    detect_sold_out = cfg["monitor_options"].get("detect_sold_out", True)
-    snapshot_changes = detect_soldout_delta(conn, products, detect_sold_out, now_str)
-
-    existing_ids = {c["product_id"]: c for c in changes}
-    for sc in snapshot_changes:
-        if sc["product_id"] not in existing_ids:
-            changes.append(sc)
-            existing_ids.add(sc["product_id"])
-    for rc in recovered_changes:
-        if rc["product_id"] not in existing_ids:
-            changes.append(rc)
-
-    lightning_threshold = cfg["monitor_options"].get("lightning_sellout_threshold_seconds", 300)
-    detect_lightning_sellouts(conn, changes, now_str, lightning_threshold, publish_field="published_at")
-
-    # 恢复模式下仅发从快照恢复的变更
-    notify_is_first = is_first_run and bool(recovered_changes) and not cfg["monitor_options"].get("notify_on_first_run")
-    if notify_is_first:
-        notify_changes = [c for c in changes if c["product_id"] in {rc["product_id"] for rc in recovered_changes}]
-        logging.info(f"Recovery mode: sending {len(notify_changes)}/{len(changes)} recovered changes")
-        _dispatch_notifications(cfg, conn, notify_changes, now_str,
-                                is_first_run=False, silent=silent)
-    else:
-        _dispatch_notifications(cfg, conn, changes, now_str,
-                                is_first_run=is_first_run and not recovered_changes,
-                                silent=silent)
-
-    if changes:
-        log_changes(conn, changes, now_str)
-
-    update_db(conn, products, now_str)
-
-    # 状态快照备份 (灾难恢复用)
-    snapshot_path = cfg.get("state_snapshot_path", "data/state_snapshot.json")
-    try:
-        snapshot_data = build_snapshot_from_db(conn)
-        save_state_snapshot(snapshot_data, snapshot_path)
-    except Exception as e:
-        logging.warning(f"Failed to save state snapshot: {e}")
-
-    elapsed = time.time() - start
-    logging.info(f"Done in {elapsed:.1f}s - {len(products)} products tracked (DB mode)")
-    return len(changes)
-
-# ---------------------------------------------------------------------------
-# 持续循环
-# ---------------------------------------------------------------------------
-def signal_handler(sig, frame):
-    global running
-    logging.info("Shutting down...")
-    running = False
 
 def main():
-    global running
-    cfg = load_config()
+    cfg = JumpShopRunner(JUMP_SHOP).load_config()
     setup_logging(cfg["log_file"])
 
     # 解析命令行参数
     once = "--once" in sys.argv
     silent = "--silent" in sys.argv
 
-    # --state-file=<path>: JSON State 模式 (Git 持久化)
     state_file = None
     for arg in sys.argv:
         if arg.startswith("--state-file="):
@@ -562,7 +327,6 @@ def main():
         elif arg == "--state-file" and sys.argv.index(arg) + 1 < len(sys.argv):
             state_file = sys.argv[sys.argv.index(arg) + 1]
 
-    # --db=<path>: 可选 DB (仅用于 change_log, 不影响变更检测)
     db_path = None
     for arg in sys.argv:
         if arg.startswith("--db="):
@@ -570,34 +334,17 @@ def main():
         elif arg == "--db" and sys.argv.index(arg) + 1 < len(sys.argv):
             db_path = sys.argv[sys.argv.index(arg) + 1]
 
-    # --recover-from=<path>: 灾难恢复 (仅 DB 模式)
-    recover_from = None
-    for arg in sys.argv:
-        if arg.startswith("--recover-from="):
-            recover_from = arg.split("=", 1)[1]
-        elif arg == "--recover-from" and sys.argv.index(arg) + 1 < len(sys.argv):
-            recover_from = sys.argv[sys.argv.index(arg) + 1]
+    runner = JumpShopRunner(JUMP_SHOP)
 
-    # 初始化 DB (change_log + 向后兼容)
+    # 初始化 DB
     conn = None
-    if state_file:
-        # JSON State 模式: DB 可选, 仅用于 change_log
-        if db_path:
-            try:
-                conn = init_db(db_path)
-            except Exception as e:
-                logging.warning("DB init failed, change_log disabled: %s", e)
-        else:
-            default_db = cfg.get("database_path", "data/products.db")
-            try:
-                conn = init_db(default_db)
-            except Exception as e:
-                logging.warning("DB init failed (non-fatal in state-file mode): %s", e)
-    else:
-        # DB 模式: DB 必须可用
-        conn = init_db(cfg["database_path"])
+    target_db = db_path or cfg.get("database_path", "data/products.db")
+    try:
+        conn = runner.init_db(target_db)
+    except Exception as e:
+        logging.warning("DB init failed (non-fatal in state-file mode): %s", e)
 
-    # 判断是否首次运行
+    # 判断首次运行
     is_first_run = False
     if conn:
         try:
@@ -611,47 +358,264 @@ def main():
     if is_first_run:
         logging.info("First run - building baseline...")
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     if once:
-        run_once(cfg, conn, is_first_run=is_first_run, silent=silent,
-                 recover_from=recover_from, state_file=state_file)
+        # ---- JSON State 模式 (GitHub Actions 主路径) ----
+        if state_file:
+            runner.run_once(cfg, state_file, db_conn=conn, silent=silent)
+        else:
+            # ---- DB 模式 (向后兼容, 本地开发) ----
+            _run_once_db(cfg, conn, is_first_run, silent)
         if conn:
             conn.close()
         return
 
+    # ---- 持续循环 (本地开发) ----
+    if state_file:
+        runner.run_continuous(cfg, state_file, db_conn=conn)
+    else:
+        _run_continuous_db(cfg, conn, is_first_run)
+
+    if conn:
+        conn.close()
+    logging.info("Monitor stopped")
+
+
+# ---------------------------------------------------------------------------
+# DB 模式 (向后兼容, 仅本地开发使用)
+# ---------------------------------------------------------------------------
+
+def _run_once_db(cfg, conn, is_first_run=False, silent=False):
+    """DB 模式单次检查 (向后兼容)"""
+    start = time.time()
+    logging.info("Checking Jump Shop (DB mode)...")
+
+    products_raw = fetch_all_products(cfg["shop_url"], cfg["user_agents"])
+    if not products_raw:
+        logging.error("Failed to fetch products")
+        return 0
+
+    products = [normalize_product(p) for p in products_raw]
+    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+
+    min_expected = cfg["monitor_options"].get("min_product_count", 100)
+    if len(products) < min_expected:
+        logging.error("PRODUCT COUNT ANOMALY: got %d, expected >= %d",
+                      len(products), min_expected)
+        return 0
+
+    changes, _ = _detect_changes_db(conn, products, cfg)
+    _detect_soldout_delta_db(conn, products, changes, cfg, now_str)
+    _detect_lightning_db(conn, changes, now_str, cfg)
+
+    if changes:
+        log_changes(conn, changes, now_str)
+    _update_db_simple(conn, products, now_str)
+
+    _dispatch_db(cfg, conn, changes, now_str, is_first_run, silent)
+
+    elapsed = time.time() - start
+    logging.info("Done in %.1fs - %d products (DB mode)", elapsed, len(products))
+    return len(changes)
+
+
+def _detect_changes_db(conn, products, cfg):
+    now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+    changes = []
+    for p in products:
+        pid = p["id"]
+        cur = conn.execute(
+            "SELECT price, available, updated_at FROM products WHERE id=?", (pid,))
+        old = cur.fetchone()
+        if old is None:
+            if cfg["monitor_options"].get("detect_new_products", True):
+                changes.append({
+                    "product_id": pid, "change_type": "new",
+                    "old_value": None,
+                    "new_value": f"{p['title']} | Y{p['price']} | "
+                                 f"{'in stock' if p['available'] else 'out of stock'}",
+                    "product": p,
+                })
+        else:
+            old_price, old_available, old_updated = old
+            if cfg["monitor_options"].get("detect_restocks", True) and \
+               old_available == 0 and p["available"] == 1:
+                changes.append({
+                    "product_id": pid, "change_type": "restock",
+                    "old_value": "out of stock", "new_value": "in stock",
+                    "product": p,
+                })
+            if cfg["monitor_options"].get("detect_sold_out", True) and \
+               old_available == 1 and p["available"] == 0:
+                changes.append({
+                    "product_id": pid, "change_type": "sold_out",
+                    "old_value": "in stock", "new_value": "out of stock",
+                    "product": p,
+                })
+            if cfg["monitor_options"].get("detect_price_changes", True) and \
+               old_price != p["price"] and old_price != 0:
+                changes.append({
+                    "product_id": pid, "change_type": "price_change",
+                    "old_value": f"Y{old_price}", "new_value": f"Y{p['price']}",
+                    "product": p,
+                })
+    return changes, now_str
+
+
+def _detect_soldout_delta_db(conn, products, changes, cfg, now_str):
+    """DB 模式 soldout delta (向后兼容)"""
+    if not cfg["monitor_options"].get("detect_sold_out", True):
+        return
+    current_soldout = {p["id"] for p in products if p["available"] == 0}
+    row = conn.execute(
+        "SELECT soldout_ids FROM soldout_snapshot WHERE id=1").fetchone()
+    last_soldout = set()
+    if row and row[0]:
+        try:
+            last_soldout = set(json.loads(row[0]))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    product_map = {p["id"]: p for p in products}
+    existing_ids = {c["product_id"] for c in changes}
+
+    for pid in current_soldout - last_soldout:
+        if pid not in existing_ids and pid in product_map:
+            changes.append({
+                "product_id": pid, "change_type": "sold_out",
+                "old_value": "in stock", "new_value": "sold out (snapshot)",
+                "product": product_map[pid],
+            })
+
+    conn.execute(
+        "UPDATE soldout_snapshot SET soldout_ids=?, updated_at=? WHERE id=1",
+        (json.dumps(list(current_soldout)), now_str))
+    conn.commit()
+
+
+def _detect_lightning_db(conn, changes, now_str, cfg):
+    """DB 模式闪电售罄 (向后兼容)"""
+    from common import parse_timestamp, format_duration
+    threshold = cfg["monitor_options"].get("lightning_sellout_threshold_seconds", 300)
+    if threshold <= 0:
+        return
+    now_dt = parse_timestamp(now_str)
+    if not now_dt:
+        return
+    for c in changes:
+        if c["change_type"] != "sold_out":
+            continue
+        pid = c["product_id"]
+        row = conn.execute(
+            "SELECT last_available_at, published_at, first_seen "
+            "FROM products WHERE id=?", (pid,)).fetchone()
+        if not row:
+            continue
+        for src_label, ts_val in [
+            ("last_available", row[0]),
+            ("published", row[1]),
+            ("first_seen", row[2]),
+        ]:
+            if not ts_val:
+                continue
+            ref = parse_timestamp(ts_val)
+            if ref:
+                delta = (now_dt - ref).total_seconds()
+                if 0 <= delta <= threshold:
+                    c["lightning"] = {
+                        "sellout_seconds": int(delta),
+                        "source": src_label,
+                        "display": format_duration(int(delta)),
+                    }
+                    break
+
+
+def _update_db_simple(conn, products, now_str):
+    for p in products:
+        conn.execute("""
+            INSERT INTO products (id, title, handle, vendor, tags, price,
+                available, sku, image_url, url, published_at, updated_at,
+                first_seen, last_checked, last_available_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title, handle=excluded.handle,
+                vendor=excluded.vendor, tags=excluded.tags,
+                price=excluded.price, available=excluded.available,
+                sku=excluded.sku, image_url=excluded.image_url,
+                url=excluded.url, published_at=excluded.published_at,
+                updated_at=excluded.updated_at,
+                last_checked=excluded.last_checked,
+                last_available_at=CASE
+                    WHEN excluded.available = 1 THEN excluded.last_checked
+                    ELSE products.last_available_at
+                END
+        """, (p["id"], p["title"], p["handle"], p["vendor"], p["tags"],
+              p["price"], p["available"], p["sku"], p["image_url"],
+              p["url"], p["published_at"], p["updated_at"],
+              now_str, now_str, now_str))
+    conn.commit()
+
+
+def _dispatch_db(cfg, conn, changes, now_str, is_first_run, silent):
+    """DB 模式通知分发 (使用 MonitorRunner 的防御层)"""
+    if not changes:
+        return
+    logging.info("Detected %d changes", len(changes))
+    for c in changes[:10]:
+        label = {"new": "[NEW]", "restock": "[RESTOCK]",
+                 "sold_out": "[SOLD OUT]", "price_change": "[PRICE]"}[c['change_type']]
+        if c.get("lightning"):
+            label += " ⚡"
+        logging.info("  %s %s | Y%d", label,
+                    c["product"]["title"][:60], c["product"]["price"])
+    if len(changes) > 10:
+        logging.info("  ... and %d more", len(changes) - 10)
+
+    if is_first_run and not cfg["monitor_options"].get("notify_on_first_run"):
+        logging.info("First run - skipping all notifications (baseline build)")
+        return
+    if silent:
+        logging.info("Silent mode - skipping notifications")
+        return
+
+    # Use MonitorRunner's dispatch via a temporary runner
+    runner = JumpShopRunner(JUMP_SHOP)
+    runner._send_all_notifications(cfg, conn, changes, now_str)
+
+
+def _run_continuous_db(cfg, conn, is_first_run):
+    """DB 模式持续循环 (向后兼容)"""
+    import signal as sig
+    running = True
+
+    def handler(s, f):
+        nonlocal running
+        logging.info("Shutting down...")
+        running = False
+    sig.signal(sig.SIGINT, handler)
+    sig.signal(sig.SIGTERM, handler)
+
     interval = cfg.get("poll_interval_seconds", 300)
-    logging.info(f"Continuous monitoring started (interval={interval}s). Press Ctrl+C to stop.")
+    logging.info("Continuous monitoring started (interval=%ds, DB mode). "
+                 "Press Ctrl+C to stop.", interval)
 
     while running:
         try:
-            run_once(cfg, conn, is_first_run=is_first_run, silent=silent,
-                     recover_from=recover_from, state_file=state_file)
+            _run_once_db(cfg, conn, is_first_run)
             is_first_run = False
-            recover_from = None
         except KeyboardInterrupt:
-            logging.info("Keyboard interrupt received")
-            break
-        except SystemExit:
             break
         except Exception as e:
-            logging.error(f"Run failed: {e}", exc_info=True)
-
+            logging.error("Run failed: %s", e, exc_info=True)
         if not running:
             break
-
         jitter = random.uniform(-0.2, 0.2) * interval
         wait = interval + jitter
-        logging.info(f"Next check in {wait:.0f}s...")
+        logging.info("Next check in %.0fs...", wait)
         for _ in range(int(wait)):
             if not running:
                 break
             time.sleep(1)
 
-    if conn:
-        conn.close()
-    logging.info("Monitor stopped")
 
 if __name__ == "__main__":
     main()

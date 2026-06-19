@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Jump Shop + ufotable WEBSHOP 监控共享模块 — 飞书API、售罄快照、通知卡片"""
+"""Jump Shop + ufotable WEBSHOP 监控共享模块 — 飞书API、售罄快照、通知卡片、监控基类"""
 
 import json
 import os
+import sys
 import time
+import sqlite3
+import signal
+import random
 import logging
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -785,6 +790,50 @@ def save_json_state(state, filepath):
                  len(state.get("products", {})), len(state.get("soldout_ids", [])))
 
 
+# =============================================================================
+# 状态完整性校验 (v2.1) — 多层防御杜绝断路器误触发
+# =============================================================================
+def validate_state_integrity(state, expected_min_products=50):
+    """校验 JSON 状态文件的完整性。
+
+    防御层:
+      1. total_products 与 len(products) 一致性检查
+      2. 历史大状态突然变空 → 强制 first_run
+      3. soldout_ids 合理性检查
+
+    返回: (is_valid: bool, force_first_run: bool, reason: str)
+    """
+    products = state.get("products", {})
+    actual_total = len(products)
+    reported_total = state.get("total_products", 0)
+    soldout_ids = state.get("soldout_ids", [])
+
+    # 1. total_products 一致性: 偏差 >15% 标记异常
+    if reported_total > 0 and actual_total > 0:
+        drift_pct = abs(actual_total - reported_total) / max(reported_total, 1)
+        if drift_pct > 0.15:
+            return False, True, (
+                f"total_products mismatch: reported={reported_total}, actual={actual_total}"
+            )
+
+    # 2. 历史大状态突然变空 → 强制 first_run (防止部分损坏后漏过断路器)
+    if reported_total > expected_min_products and actual_total == 0:
+        return False, True, (
+            f"State emptied: was {reported_total} products, now 0"
+        )
+
+    # 3. soldout_ids 孤儿检测: >50% soldout_ids 不在 products 中 → 异常
+    if soldout_ids and actual_total > 0:
+        valid_ids = set(products.keys())
+        orphan_soldout = [sid for sid in soldout_ids if str(sid) not in valid_ids]
+        if len(orphan_soldout) > len(soldout_ids) * 0.5:
+            return False, False, (
+                f"Too many orphan soldout_ids: {len(orphan_soldout)}/{len(soldout_ids)}"
+            )
+
+    return True, False, "OK"
+
+
 def _product_entry(p):
     """从 normalize 后的 product dict 提取状态条目"""
     return {
@@ -815,6 +864,21 @@ def detect_all_changes_from_state(old_state, products, now_str, cfg):
     existing_ids = set()   # 用于 soldout_delta 去重
     current_soldout = set()
     product_map = {}
+
+    # ---- 产品数突变检测 (防御层1: 在变更检测前拦截状态损坏) ----
+    old_total = len(old_products)
+    new_total = len(products)
+    if old_total > 50 and new_total > 0:
+        ratio = old_total / max(new_total, 1)
+        # 如果旧状态产品数相比当前 API 产品数突变 (ratio<0.3 或 >3.0)，
+        # 可能是状态文件损坏导致部分产品丢失 → 静默返回空变更
+        if ratio < 0.3 or ratio > 3.0:
+            logging.warning(
+                "STATE INTEGRITY: old=%d products, new=%d (old/new=%.2f). "
+                "Possible state corruption — suppressing change detection.",
+                old_total, new_total, ratio
+            )
+            return [], sorted(current_soldout)
 
     for p in products:
         pid = str(p["id"])
@@ -970,3 +1034,355 @@ def build_new_state(products, old_state, now_str):
         new_products[pid] = entry
 
     return new_products
+
+
+# =============================================================================
+# ShopConfig + MonitorRunner — 统一监控基类 (v2.1)
+# 消除 monitor_loop.py / ufotable_monitor.py 之间 ~300 行重复代码
+# =============================================================================
+
+@dataclass
+class ShopConfig:
+    """商店配置 — 替代分散的字典常量"""
+    name: str
+    template_color: str          # "red" | "blue"
+    footer: str
+    subtitle_field: str          # "vendor" | "works"
+    shop_url: str
+    api_base: str = ""
+    state_file_default: str = ""
+    db_path_default: str = ""
+    config_path: str = ""
+    config_example_path: str = ""
+    min_product_count: int = 50
+
+
+class MonitorRunner:
+    """监控运行器基类 — 统一 JSON State 模式的完整监控流程。
+
+    子类只需实现:
+      - fetch_products(cfg) → list[dict]  (已标准化的商品列表)
+      - update_db(conn, products, now_str) (可选, DB 写入)
+
+    用法:
+      runner = JumpShopRunner(ShopConfig(...))
+      cfg = runner.load_config()
+      conn = runner.init_db(cfg["database_path"])
+      runner.run_once(cfg, "data/state.json", db_conn=conn)
+    """
+
+    def __init__(self, shop: ShopConfig):
+        self.shop = shop
+        self.running = True
+
+    # ------------------------------------------------------------------
+    # 子类必须实现
+    # ------------------------------------------------------------------
+
+    def fetch_products(self, cfg: dict) -> list:
+        """拉取并返回已标准化的商品列表 (子类实现)"""
+        raise NotImplementedError("Subclass must implement fetch_products()")
+
+    # ------------------------------------------------------------------
+    # Config
+    # ------------------------------------------------------------------
+
+    def load_config(self, path=None) -> dict:
+        """加载配置, 自动从环境变量注入飞书凭据"""
+        if path is None:
+            path = self.shop.config_path
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        elif os.path.exists(self.shop.config_example_path):
+            cfg = json.load(open(self.shop.config_example_path, "r", encoding="utf-8"))
+        else:
+            cfg = {}
+
+        # 注入环境变量 (GitHub Secrets)
+        env_map = {
+            "FEISHU_WEBHOOK_URL": "webhook_url",
+            "FEISHU_APP_ID": "app_id",
+            "FEISHU_APP_SECRET": "app_secret",
+        }
+        for env_key, cfg_key in env_map.items():
+            if os.environ.get(env_key):
+                nc = cfg.setdefault("notifications", {}).setdefault("feishu", {})
+                nc[cfg_key] = os.environ[env_key]
+        return cfg
+
+    # ------------------------------------------------------------------
+    # DB
+    # ------------------------------------------------------------------
+
+    def init_db(self, db_path: str) -> sqlite3.Connection:
+        """初始化 SQLite DB (change_log 表), 子类可覆盖以扩展表结构"""
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER, change_type TEXT,
+                old_value TEXT, new_value TEXT,
+                detected_at TEXT, notified INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        return conn
+
+    # ------------------------------------------------------------------
+    # 核心: 一次性监控检查
+    # ------------------------------------------------------------------
+
+    def run_once(self, cfg: dict, state_file: str,
+                 db_conn=None, silent: bool = False) -> int:
+        """执行一次完整的监控检查 (JSON State 模式)。
+
+        流程: 拉取 → 校验 → 变更检测 → 闪电售罄 → 通知 → 保存状态
+        返回: 检测到的变更数量
+        """
+        start = time.time()
+        logging.info("Checking %s...", self.shop.name)
+
+        # 1. 拉取商品
+        products = self.fetch_products(cfg)
+        if not products:
+            logging.error("Failed to fetch products")
+            return 0
+
+        now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+
+        # 2. 产品数异常检测 (API 返回部分数据)
+        min_expected = cfg.get("monitor_options", {}).get(
+            "min_product_count", self.shop.min_product_count)
+        if len(products) < min_expected:
+            logging.error(
+                "PRODUCT COUNT ANOMALY: got %d products, expected >= %d. "
+                "API may be returning partial data — skipping this cycle.",
+                len(products), min_expected
+            )
+            return 0
+
+        # 3. 加载旧状态 + 完整性校验
+        old_state = load_json_state(state_file)
+        valid, force_first, reason = validate_state_integrity(old_state)
+        first_run = len(old_state.get("products", {})) == 0
+        if force_first:
+            logging.warning("State integrity — forcing first_run: %s", reason)
+            first_run = True
+
+        if first_run:
+            logging.info("First run with JSON state - building baseline...")
+
+        # 4. 产品数漂移日志 (仅警告, 不拦截)
+        old_total = old_state.get("total_products", 0)
+        if old_total > 0 and not first_run:
+            ratio = len(products) / old_total
+            if ratio < 0.5 or ratio > 1.5:
+                logging.warning(
+                    "PRODUCT COUNT DRIFT: %d → %d (%.0f%%). "
+                    "Possible API issue or massive inventory change.",
+                    old_total, len(products), ratio * 100
+                )
+
+        # 5. 变更检测 (new/restock/sold_out/price_change + soldout_delta)
+        changes, soldout_ids = detect_all_changes_from_state(
+            old_state, products, now_str, cfg)
+
+        # 6. 闪电售罄检测
+        lightning_threshold = cfg.get("monitor_options", {}).get(
+            "lightning_sellout_threshold_seconds", 300)
+        detect_lightning_from_state(old_state, changes, now_str, lightning_threshold)
+
+        # 7. 通知分发
+        self._dispatch_notifications(
+            cfg, db_conn, changes, now_str, first_run, silent,
+            old_total=old_total)
+
+        # 8. 记录变更到 DB
+        if changes and db_conn:
+            try:
+                log_changes(db_conn, changes, now_str)
+            except Exception as e:
+                logging.warning("Failed to log changes to DB: %s", e)
+
+        # 9. 构建并保存新状态
+        new_products = build_new_state(products, old_state, now_str)
+        new_state = {
+            "version": 2,
+            "updated_at": now_str,
+            "total_products": len(products),
+            "soldout_ids": soldout_ids,
+            "products": new_products,
+        }
+        save_json_state(new_state, state_file)
+
+        # 10. 同步 DB (可选, 供 analysis.py 使用)
+        if db_conn:
+            try:
+                self.update_db(db_conn, products, now_str)
+            except Exception as e:
+                logging.warning("Failed to update DB: %s", e)
+
+        elapsed = time.time() - start
+        logging.info("Done in %.1fs - %d products tracked (JSON state)",
+                     elapsed, len(products))
+        return len(changes)
+
+    def update_db(self, conn, products, now_str):
+        """更新 DB 商品表 (子类覆盖以匹配各自表结构)"""
+        pass
+
+    # ------------------------------------------------------------------
+    # 通知分发 (统一版: 断路 + 分页 + Bot 预警 + 多层防御)
+    # ------------------------------------------------------------------
+
+    def _dispatch_notifications(self, cfg, conn, changes, now_str,
+                                 is_first_run, silent, old_total=0):
+        """统一的通知分发逻辑。
+
+        防御层 (按优先级):
+          1. 首次运行静默 (不轰炸基线)
+          2. Silent 模式
+          3. **产品数漂移检测** — old_total 与新上新数对比, 防状态损坏
+          4. **断路器** — 上新 > 阈值 → 纯文本摘要
+          5. 正常通知 → 飞书卡片 + Bot 预警
+        """
+        if not changes:
+            return
+
+        # 简短的变更摘要
+        logging.info("Detected %d changes", len(changes))
+        for c in changes[:10]:
+            p = c["product"]
+            label = CHANGE_LABELS[c['change_type']]
+            if c.get("lightning"):
+                label += " ⚡"
+            logging.info("  %s %s | Y%d", label, p.get('title', '')[:60],
+                        p.get('price', 0))
+        if len(changes) > 10:
+            logging.info("  ... and %d more", len(changes) - 10)
+
+        # --- 防御层 1: 首次运行静默 ---
+        if is_first_run and not cfg.get("monitor_options", {}).get(
+                "notify_on_first_run"):
+            logging.info("First run - skipping all notifications (baseline build)")
+            return
+
+        # --- 防御层 2: Silent ---
+        if silent:
+            logging.info("Silent mode - skipping notifications")
+            return
+
+        new_count = sum(1 for c in changes if c["change_type"] == "new")
+
+        # --- 防御层 3: 产品数漂移检测 (NEW in v2.1) ---
+        # 如果上新数超过旧状态产品总数的 30%，极可能是状态损坏而非真实上新
+        if old_total > 50 and new_count > old_total * 0.3:
+            logging.error(
+                "DRIFT SHIELD: %d new out of %d old total (%.0f%%). "
+                "Suppressing ALL notifications — likely state corruption.",
+                new_count, old_total,
+                new_count / max(old_total, 1) * 100
+            )
+            return  # 完全静默，连断路器摘要都不发
+
+        # --- 防御层 4: 断路器 ---
+        fuse_threshold = cfg.get("monitor_options", {}).get(
+            "new_product_fuse_threshold", 150)
+        if new_count > fuse_threshold:
+            logging.warning(
+                "CIRCUIT BREAKER: %d new products exceeds threshold %d",
+                new_count, fuse_threshold)
+            # 降级为纯文本摘要
+            summary_text = (
+                f"{self.shop.name} 異常検知\n\n"
+                f"新商品数 {new_count} 件が闘値 {fuse_threshold} を超えました。\n"
+                f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
+                f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
+                f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
+                f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
+                f"{now_str} | {self.shop.footer}"
+            )
+            feishu_cfg = cfg.get("notifications", {}).get("feishu", {})
+            if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
+                send_feishu_card(
+                    feishu_cfg["webhook_url"],
+                    {"msg_type": "text", "content": {"text": summary_text}},
+                )
+            return
+
+        # --- 正常通知 ---
+        self._send_all_notifications(cfg, conn, changes, now_str)
+
+    def _send_all_notifications(self, cfg, conn, changes, now_str):
+        """发送所有已启用的通知 (飞书卡片 + Bot 预警).
+        子类可覆盖以添加额外的通知渠道 (企业微信/邮件等).
+        """
+        nc = cfg.get("notifications", {})
+        feishu_cfg = nc.get("feishu", {})
+
+        if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
+            # 图片上传
+            if feishu_cfg.get("image_preview") and feishu_cfg.get("app_id"):
+                ensure_image_keys(conn, changes, feishu_cfg)
+
+            # 主卡片通知
+            shop_card = {
+                "name": self.shop.name,
+                "template_color": self.shop.template_color,
+                "footer": self.shop.footer,
+                "subtitle_field": self.shop.subtitle_field,
+            }
+            cards = build_feishu_cards(changes, now_str, shop_card)
+            send_feishu_card(feishu_cfg["webhook_url"], cards)
+
+            # Bot 扫货预警
+            mo = cfg.get("monitor_options", {})
+            if mo.get("bot_alert_enabled", True):
+                bot_min = mo.get("bot_alert_min_count", 3)
+                maybe_send_bot_alert(
+                    feishu_cfg["webhook_url"], changes, now_str,
+                    shop_card, min_count=bot_min)
+
+    # ------------------------------------------------------------------
+    # 持续运行
+    # ------------------------------------------------------------------
+
+    def _setup_signal_handlers(self):
+        """注册 SIGINT/SIGTERM 处理器"""
+        def handler(sig, frame):
+            logging.info("Shutting down...")
+            self.running = False
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
+
+    def run_continuous(self, cfg, state_file, db_conn=None):
+        """持续监控循环 (自循环模式, 用于本地开发)"""
+        self._setup_signal_handlers()
+        interval = cfg.get("poll_interval_seconds", 300)
+        logging.info("Continuous monitoring started (interval=%ds). "
+                     "Press Ctrl+C to stop.", interval)
+
+        while self.running:
+            try:
+                self.run_once(cfg, state_file, db_conn=db_conn)
+            except KeyboardInterrupt:
+                logging.info("Keyboard interrupt received")
+                break
+            except SystemExit:
+                break
+            except Exception as e:
+                logging.error("Run failed: %s", e, exc_info=True)
+
+            if not self.running:
+                break
+
+            jitter = random.uniform(-0.2, 0.2) * interval
+            wait = interval + jitter
+            logging.info("Next check in %.0fs...", wait)
+            for _ in range(int(wait)):
+                if not self.running:
+                    break
+                time.sleep(1)

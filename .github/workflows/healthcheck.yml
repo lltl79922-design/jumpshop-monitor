@@ -129,12 +129,22 @@ jobs:
         if: always()
         run: |
           if [ ! -f data/jumpshop_state.json ] || ! python -c "import json; json.load(open('data/jumpshop_state.json'))" 2>/dev/null; then
-            echo "State file missing or corrupt, initializing fresh..."
+            echo "State file missing or corrupt, attempting recovery from git history..."
             mkdir -p data
-            echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/jumpshop_state.json
-            git add data/jumpshop_state.json
-            git config user.email "bot@jumpshop.monitor"
-            git config user.name "Jump Shop Monitor Bot"
-            git commit -m "bot(jumpshop): healthcheck state repair [skip ci]" || true
-            git pull --rebase origin main && git push origin main || echo "Push failed (will retry next run)"
+            # Recover last valid state from git history instead of creating empty state
+            LAST_VALID=$(git log --all --format="%H" -- data/jumpshop_state.json 2>/dev/null | head -1)
+            if [ -n "$LAST_VALID" ]; then
+              git show "$LAST_VALID:data/jumpshop_state.json" > data/jumpshop_state.json 2>/dev/null || true
+              if python -c "import json; s=json.load(open('data/jumpshop_state.json')); assert len(s.get('products',{}))>0" 2>/dev/null; then
+                echo "Recovered valid state ($(python -c "import json; print(len(json.load(open('data/jumpshop_state.json')).get('products',{})))") products) from git history"
+              else
+                echo "Git recovery failed or returned empty state, initializing fresh (first run)"
+                echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/jumpshop_state.json
+              fi
+            else
+              echo "No git history found, initializing fresh (first run)"
+              echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/jumpshop_state.json
+            fi
+            # Do NOT push — let the monitor workflow handle state persistence
+            echo "Auto-repair completed (local only, monitor will push)"
           fi
