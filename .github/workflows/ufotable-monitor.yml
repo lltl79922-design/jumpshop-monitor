@@ -46,7 +46,8 @@ jobs:
 
           mkdir -p data
 
-          git pull --rebase origin main 2>/dev/null || true
+          # Pull latest state from git (v3: fetch+reset, no rebase)
+          git fetch origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null || true
 
           if [ ! -f data/ufotable_state.json ]; then
             echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > data/ufotable_state.json
@@ -58,30 +59,43 @@ jobs:
 
           push_state() {
             local label="$1"
-            git add data/ufotable_state.json
-            if git diff --staged --quiet; then
-              echo "  [push_state:$label] no changes"
-              return 0
-            fi
-            git commit -m "bot(ufotable): state $label [skip ci]" || return 1
-            # Pull with rebase — detect and recover from conflicts
-            REBASE_OUT=$(git pull --rebase origin main 2>&1)
-            REBASE_RC=$?
-            if [ $REBASE_RC -ne 0 ]; then
-              echo "  [push_state:$label] REBASE CONFLICT — aborting and restoring local state"
-              git rebase --abort 2>/dev/null || true
-              echo "  [push_state:$label] rebase aborted, will retry push"
-            fi
-            for i in 1 2 3; do
-              if git push origin main 2>&1; then
-                echo "  [push_state:$label] OK"
+            local STATE_FILE="data/ufotable_state.json"
+            local BACKUP="/tmp/ufotable_state_backup.json"
+
+            # Always backup state first — this is the single source of truth
+            cp "$STATE_FILE" "$BACKUP"
+
+            for attempt in 1 2 3; do
+              # Sync with remote (discard any stale local commits)
+              git fetch origin main 2>/dev/null
+              git reset --hard origin/main 2>/dev/null
+
+              # Re-apply our state file (always newer than remote)
+              cp "$BACKUP" "$STATE_FILE"
+              git add "$STATE_FILE"
+
+              if git diff --staged --quiet; then
+                echo "  [push_state:$label] no changes vs remote"
+                rm -f "$BACKUP"
                 return 0
               fi
-              echo "  [push_state:$label] retry $i/3..."
-              git pull --rebase origin main 2>/dev/null || git rebase --abort 2>/dev/null || true
+
+              git commit -m "bot(ufotable): state $label [skip ci]" 2>/dev/null || true
+
+              if git push origin main 2>&1; then
+                echo "  [push_state:$label] OK (attempt $attempt)"
+                rm -f "$BACKUP"
+                return 0
+              fi
+
+              echo "  [push_state:$label] attempt $attempt/3 failed, retrying..."
               sleep 3
             done
-            echo "  [push_state:$label] FAILED (non-fatal)"
+
+            echo "  [push_state:$label] FAILED after 3 attempts (non-fatal)"
+            # Restore state file so next Python iteration has correct baseline
+            cp "$BACKUP" "$STATE_FILE"
+            rm -f "$BACKUP"
             return 1
           }
 

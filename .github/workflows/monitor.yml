@@ -47,8 +47,8 @@ jobs:
 
           mkdir -p data
 
-          # Pull latest state from git
-          git pull --rebase origin main 2>/dev/null || true
+          # Pull latest state from git (v3: fetch+reset, no rebase)
+          git fetch origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null || true
 
           # Init state file if first run ever
           if [ ! -f data/jumpshop_state.json ]; then
@@ -59,33 +59,48 @@ jobs:
           git config user.email "bot@jumpshop.monitor"
           git config user.name "Jump Shop Monitor Bot"
 
-          # Helper: push state to git (best-effort, with retry + rebase conflict detection)
+          # Helper: push state to git (v3: fetch+reset instead of rebase — prevents state corruption)
+          # Strategy: backup state → sync with remote → re-apply state → commit → push
+          # This avoids git rebase entirely, which was the #1 cause of state file corruption
           push_state() {
             local label="$1"
-            git add data/jumpshop_state.json
-            if git diff --staged --quiet; then
-              echo "  [push_state:$label] no changes"
-              return 0
-            fi
-            git commit -m "bot(jumpshop): state $label [skip ci]" || { echo "  [push_state:$label] commit failed"; return 1; }
-            # Pull with rebase — detect and recover from conflicts
-            REBASE_OUT=$(git pull --rebase origin main 2>&1)
-            REBASE_RC=$?
-            if [ $REBASE_RC -ne 0 ]; then
-              echo "  [push_state:$label] REBASE CONFLICT — aborting and restoring local state"
-              git rebase --abort 2>/dev/null || true
-              echo "  [push_state:$label] rebase aborted, will retry push"
-            fi
-            for i in 1 2 3; do
-              if git push origin main 2>&1; then
-                echo "  [push_state:$label] OK"
+            local STATE_FILE="data/jumpshop_state.json"
+            local BACKUP="/tmp/jumpshop_state_backup.json"
+
+            # Always backup state first — this is the single source of truth
+            cp "$STATE_FILE" "$BACKUP"
+
+            for attempt in 1 2 3; do
+              # Sync with remote (discard any stale local commits)
+              git fetch origin main 2>/dev/null
+              git reset --hard origin/main 2>/dev/null
+
+              # Re-apply our state file (always newer than remote)
+              cp "$BACKUP" "$STATE_FILE"
+              git add "$STATE_FILE"
+
+              if git diff --staged --quiet; then
+                echo "  [push_state:$label] no changes vs remote"
+                rm -f "$BACKUP"
                 return 0
               fi
-              echo "  [push_state:$label] retry $i/3..."
-              git pull --rebase origin main 2>/dev/null || git rebase --abort 2>/dev/null || true
+
+              git commit -m "bot(jumpshop): state $label [skip ci]" 2>/dev/null || true
+
+              if git push origin main 2>&1; then
+                echo "  [push_state:$label] OK (attempt $attempt)"
+                rm -f "$BACKUP"
+                return 0
+              fi
+
+              echo "  [push_state:$label] attempt $attempt/3 failed, retrying..."
               sleep 3
             done
-            echo "  [push_state:$label] FAILED (non-fatal)"
+
+            echo "  [push_state:$label] FAILED after 3 attempts (non-fatal)"
+            # Restore state file so next Python iteration has correct baseline
+            cp "$BACKUP" "$STATE_FILE"
+            rm -f "$BACKUP"
             return 1
           }
 

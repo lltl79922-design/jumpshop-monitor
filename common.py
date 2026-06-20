@@ -868,11 +868,25 @@ def detect_all_changes_from_state(old_state, products, now_str, cfg):
     # ---- 产品数突变检测 (防御层1: 在变更检测前拦截状态损坏) ----
     old_total = len(old_products)
     new_total = len(products)
+    # 同时检查 metadata 中的 total_products 与实际 products dict 长度是否一致
+    reported_total = old_state.get("total_products", 0)
+    meta_drift = False
+    if reported_total > 50 and old_total > 0:
+        meta_ratio = old_total / max(reported_total, 1)
+        if meta_ratio < 0.5:
+            logging.warning(
+                "STATE METADATA DRIFT: total_products=%d but actual products=%d (ratio=%.2f). "
+                "State file partially corrupted — suppressing change detection.",
+                reported_total, old_total, meta_ratio
+            )
+            meta_drift = True
+
     if old_total > 50 and new_total > 0:
         ratio = old_total / max(new_total, 1)
-        # 如果旧状态产品数相比当前 API 产品数突变 (ratio<0.3 或 >3.0)，
+        # 如果旧状态产品数相比当前 API 产品数突变 (ratio<0.5 或 >2.0)，
         # 可能是状态文件损坏导致部分产品丢失 → 静默返回空变更
-        if ratio < 0.3 or ratio > 3.0:
+        # v2.2: 阈值从 0.3 收紧到 0.5，更激进地拦截部分损坏
+        if ratio < 0.5 or ratio > 2.0 or meta_drift:
             logging.warning(
                 "STATE INTEGRITY: old=%d products, new=%d (old/new=%.2f). "
                 "Possible state corruption — suppressing change detection.",
@@ -1196,9 +1210,12 @@ class MonitorRunner:
         detect_lightning_from_state(old_state, changes, now_str, lightning_threshold)
 
         # 7. 通知分发
+        # old_total 优先使用 metadata, 但如果 metadata 为0而实际有历史数据, 用实际值
+        # 防止 state corruption 导致 drift shield 盲区
+        effective_old_total = old_total if old_total > 0 else len(old_state.get("products", {}))
         self._dispatch_notifications(
             cfg, db_conn, changes, now_str, first_run, silent,
-            old_total=old_total)
+            old_total=effective_old_total)
 
         # 8. 记录变更到 DB
         if changes and db_conn:
