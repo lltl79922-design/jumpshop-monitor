@@ -1,0 +1,145 @@
+name: Self-Heal (自动修复)
+
+on:
+  schedule:
+    - cron: '13 */1 * * *'  # 每小时第13分钟
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: self-heal
+  cancel-in-progress: false
+
+jobs:
+  heal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-heal check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          set -e
+          ALERTS=""
+          HEALED=""
+
+          # ── Helper: trigger a workflow via gh CLI ──
+          trigger_workflow() {
+            local WF="$1"
+            local REASON="$2"
+            echo "  [HEAL] Triggering $WF (reason: $REASON)"
+            if gh workflow run "$WF" --ref main 2>&1; then
+              HEALED="$HEALED\n  ✅ 已自动重启 $WF ($REASON)"
+              echo "  [HEAL] $WF triggered OK"
+            else
+              ALERTS="$ALERTS\n  ❌ 无法重启 $WF: $REASON"
+              echo "  [HEAL] $WF trigger FAILED"
+            fi
+          }
+
+          # ── Check state file health ──
+          check_state() {
+            local FILE="$1"
+            local NAME="$2"
+            local WF="$3"
+            local MIN_STALE="${4:-90}"
+
+            git pull --rebase origin main 2>/dev/null || git fetch origin main && git reset --hard origin/main 2>/dev/null || true
+
+            if [ ! -f "$FILE" ]; then
+              echo "[$NAME] State file MISSING"
+              # Try recover from git
+              LAST=$(git log --all --format="%H" -- "$FILE" 2>/dev/null | head -1)
+              if [ -n "$LAST" ]; then
+                git show "$LAST:$FILE" > "$FILE" 2>/dev/null || true
+                if [ -f "$FILE" ] && python3 -c "import json; s=json.load(open('$FILE')); assert len(s.get('products',{}))>0" 2>/dev/null; then
+                  echo "[$NAME] Recovered from git history"
+                  HEALED="$HEALED\n  ✅ $NAME 状态文件从git恢复"
+                else
+                  echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > "$FILE"
+                  echo "[$NAME] Initialized fresh (first run)"
+                fi
+              else
+                echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > "$FILE"
+              fi
+              trigger_workflow "$WF" "状态文件丢失"
+              return
+            fi
+
+            # Check corruption
+            if ! python3 -c "import json; json.load(open('$FILE'))" 2>/dev/null; then
+              echo "[$NAME] State file CORRUPTED"
+              LAST=$(git log --all --format="%H" -- "$FILE" 2>/dev/null | head -1)
+              if [ -n "$LAST" ]; then
+                git show "$LAST:$FILE" > "$FILE" 2>/dev/null || true
+              fi
+              if ! python3 -c "import json; json.load(open('$FILE'))" 2>/dev/null; then
+                echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > "$FILE"
+              fi
+              trigger_workflow "$WF" "状态文件损坏"
+              return
+            fi
+
+            # Check staleness (dead man's switch)
+            AGE_MIN=$(python3 -c "
+import json
+from datetime import datetime, timezone, timedelta
+JST = timezone(timedelta(hours=9))
+try:
+    s = json.load(open('$FILE'))
+    ts = s.get('updated_at', '')
+    if ts and 'JST' in ts:
+        dt = datetime.strptime(ts.replace(' JST',''), '%Y-%m-%d %H:%M:%S').replace(tzinfo=JST)
+        age = (datetime.now(JST) - dt).total_seconds() / 60
+        print(int(age))
+    else:
+        print(9999)
+except:
+    print(9999)
+" 2>/dev/null || echo 9999)
+
+            echo "[$NAME] State age: ${AGE_MIN}min"
+            if [ "$AGE_MIN" -gt "$MIN_STALE" ]; then
+              echo "[$NAME] DEAD MAN'S SWITCH: ${AGE_MIN}min stale → auto-restart"
+              trigger_workflow "$WF" "死人开关 ${AGE_MIN}分钟未更新"
+            else
+              echo "[$NAME] OK (${AGE_MIN}min)"
+            fi
+          }
+
+          # ── Run checks ──
+          echo "=== Jump Shop Self-Heal $(date -u) ==="
+          check_state "data/jumpshop_state.json" "JumpShop" "monitor.yml" 90
+
+          echo ""
+          echo "=== ufotable Self-Heal $(date -u) ==="
+          check_state "data/ufotable_state.json" "ufotable" "ufotable-monitor.yml" 90
+
+          # ── Send summary (only if alerts) ──
+          if [ -n "$HEALED" ]; then
+            echo ""
+            echo "=== HEALING ACTIONS ==="
+            echo -e "$HEALED"
+          fi
+
+          if [ -n "$ALERTS" ]; then
+            echo ""
+            echo "=== UNRESOLVED ALERTS ==="
+            echo -e "$ALERTS"
+            if [ -n "$FEISHU_WEBHOOK_URL" ] && [ "$FEISHU_WEBHOOK_URL" != "YOUR_WEBHOOK_URL_HERE" ]; then
+              curl -s -X POST "$FEISHU_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"🔧 自愈系统无法自动修复\n$ALERTS\"}}" \
+                > /dev/null 2>&1 || true
+            fi
+          fi
+
+          echo ""
+          echo "Self-heal complete."
