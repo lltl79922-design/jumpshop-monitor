@@ -23,24 +23,32 @@ jobs:
 
       - name: Self-heal check
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
         run: |
           set -e
           ALERTS=""
           HEALED=""
 
-          # ── Helper: trigger a workflow via gh CLI ──
+          # ── Helper: trigger a workflow via GitHub REST API ──
+          # v2: use curl + API instead of gh CLI (more reliable, no auth issues)
           trigger_workflow() {
             local WF="$1"
             local REASON="$2"
             echo "  [HEAL] Triggering $WF (reason: $REASON)"
-            if gh workflow run "$WF" --ref main 2>&1; then
-              HEALED="$HEALED\n  ✅ 已自动重启 $WF ($REASON)"
-              echo "  [HEAL] $WF triggered OK"
+            local HTTP_CODE
+            HTTP_CODE=$(curl -s -o /dev/stderr -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: token ${GH_API_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF}/dispatches" \
+              -d '{"ref":"main"}' 2>&1)
+            if [ "${HTTP_CODE}" = "204" ]; then
+              HEALED="${HEALED}\n  ✅ 已自动重启 ${WF} (${REASON})"
+              echo "  [HEAL] ${WF} triggered OK (HTTP ${HTTP_CODE})"
             else
-              ALERTS="$ALERTS\n  ❌ 无法重启 $WF: $REASON"
-              echo "  [HEAL] $WF trigger FAILED"
+              ALERTS="${ALERTS}\n  ❌ 无法重启 ${WF}: ${REASON} (HTTP ${HTTP_CODE})"
+              echo "  [HEAL] ${WF} trigger FAILED (HTTP ${HTTP_CODE})"
             fi
           }
 
@@ -51,20 +59,21 @@ jobs:
             local WF="$3"
             local MIN_STALE="${4:-90}"
 
-            git pull --rebase origin main 2>/dev/null || git fetch origin main && git reset --hard origin/main 2>/dev/null || true
+            # Sync with remote (non-fatal)
+            git fetch origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null || true
 
             if [ ! -f "$FILE" ]; then
-              echo "[$NAME] State file MISSING"
+              echo "[${NAME}] State file MISSING"
               # Try recover from git
               LAST=$(git log --all --format="%H" -- "$FILE" 2>/dev/null | head -1)
               if [ -n "$LAST" ]; then
-                git show "$LAST:$FILE" > "$FILE" 2>/dev/null || true
-                if [ -f "$FILE" ] && python3 -c "import json; s=json.load(open('$FILE')); assert len(s.get('products',{}))>0" 2>/dev/null; then
-                  echo "[$NAME] Recovered from git history"
-                  HEALED="$HEALED\n  ✅ $NAME 状态文件从git恢复"
+                git show "${LAST}:${FILE}" > "$FILE" 2>/dev/null || true
+                if [ -f "$FILE" ] && python3 -c "import json; s=json.load(open('${FILE}')); assert len(s.get('products',{}))>0" 2>/dev/null; then
+                  echo "[${NAME}] Recovered from git history"
+                  HEALED="${HEALED}\n  ✅ ${NAME} 状态文件从git恢复"
                 else
                   echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > "$FILE"
-                  echo "[$NAME] Initialized fresh (first run)"
+                  echo "[${NAME}] Initialized fresh (first run)"
                 fi
               else
                 echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > "$FILE"
@@ -74,13 +83,13 @@ jobs:
             fi
 
             # Check corruption
-            if ! python3 -c "import json; json.load(open('$FILE'))" 2>/dev/null; then
-              echo "[$NAME] State file CORRUPTED"
+            if ! python3 -c "import json; json.load(open('${FILE}'))" 2>/dev/null; then
+              echo "[${NAME}] State file CORRUPTED"
               LAST=$(git log --all --format="%H" -- "$FILE" 2>/dev/null | head -1)
               if [ -n "$LAST" ]; then
-                git show "$LAST:$FILE" > "$FILE" 2>/dev/null || true
+                git show "${LAST}:${FILE}" > "$FILE" 2>/dev/null || true
               fi
-              if ! python3 -c "import json; json.load(open('$FILE'))" 2>/dev/null; then
+              if ! python3 -c "import json; json.load(open('${FILE}'))" 2>/dev/null; then
                 echo '{"version":2,"products":{},"soldout_ids":[],"updated_at":"","total_products":0}' > "$FILE"
               fi
               trigger_workflow "$WF" "状态文件损坏"
@@ -93,7 +102,7 @@ import json
 from datetime import datetime, timezone, timedelta
 JST = timezone(timedelta(hours=9))
 try:
-    s = json.load(open('$FILE'))
+    s = json.load(open('${FILE}'))
     ts = s.get('updated_at', '')
     if ts and 'JST' in ts:
         dt = datetime.strptime(ts.replace(' JST',''), '%Y-%m-%d %H:%M:%S').replace(tzinfo=JST)
@@ -105,12 +114,12 @@ except:
     print(9999)
 " 2>/dev/null || echo 9999)
 
-            echo "[$NAME] State age: ${AGE_MIN}min"
+            echo "[${NAME}] State age: ${AGE_MIN}min (threshold: ${MIN_STALE}min)"
             if [ "$AGE_MIN" -gt "$MIN_STALE" ]; then
-              echo "[$NAME] DEAD MAN'S SWITCH: ${AGE_MIN}min stale → auto-restart"
+              echo "[${NAME}] DEAD MAN'S SWITCH: ${AGE_MIN}min stale → auto-restart"
               trigger_workflow "$WF" "死人开关 ${AGE_MIN}分钟未更新"
             else
-              echo "[$NAME] OK (${AGE_MIN}min)"
+              echo "[${NAME}] OK (${AGE_MIN}min)"
             fi
           }
 
@@ -136,7 +145,7 @@ except:
             if [ -n "$FEISHU_WEBHOOK_URL" ] && [ "$FEISHU_WEBHOOK_URL" != "YOUR_WEBHOOK_URL_HERE" ]; then
               curl -s -X POST "$FEISHU_WEBHOOK_URL" \
                 -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"🔧 自愈系统无法自动修复\n$ALERTS\"}}" \
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"🔧 自愈系统无法自动修复\n${ALERTS}\"}}" \
                 > /dev/null 2>&1 || true
             fi
           fi
