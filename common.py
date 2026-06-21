@@ -1123,6 +1123,13 @@ class MonitorRunner:
             if os.environ.get(env_key):
                 nc = cfg.setdefault("notifications", {}).setdefault("feishu", {})
                 nc[cfg_key] = os.environ[env_key]
+
+        # 注入 DeepSeek API Key
+        if os.environ.get("DEEPSEEK_API_KEY"):
+            ds = cfg.setdefault("deepseek", {})
+            ds["api_key"] = os.environ["DEEPSEEK_API_KEY"]
+            ds.setdefault("enabled", True)
+
         return cfg
 
     # ------------------------------------------------------------------
@@ -1334,7 +1341,7 @@ class MonitorRunner:
         self._send_all_notifications(cfg, conn, changes, now_str)
 
     def _send_all_notifications(self, cfg, conn, changes, now_str):
-        """发送所有已启用的通知 (飞书卡片 + Bot 预警).
+        """发送所有已启用的通知 (飞书卡片 + Bot 预警 + AI 摘要).
         子类可覆盖以添加额外的通知渠道 (企业微信/邮件等).
         """
         nc = cfg.get("notifications", {})
@@ -1362,6 +1369,24 @@ class MonitorRunner:
                 maybe_send_bot_alert(
                     feishu_cfg["webhook_url"], changes, now_str,
                     shop_card, min_count=bot_min)
+
+            # AI 智能摘要 (DeepSeek)
+            ds_cfg = cfg.get("deepseek", {})
+            if ds_cfg.get("enabled") and ds_cfg.get("summary_enabled"):
+                try:
+                    from ai_analysis import summarize_changes
+                    summary = summarize_changes(
+                        changes, self.shop.name, deepseek_cfg=ds_cfg)
+                    if summary:
+                        requests.post(
+                            feishu_cfg["webhook_url"],
+                            json={"msg_type": "text", "content": {"text": summary}},
+                            timeout=15)
+                        logging.info("AI summary sent to Feishu")
+                except ImportError:
+                    logging.debug("ai_analysis module not available")
+                except Exception as e:
+                    logging.warning("AI summary failed (non-fatal): %s", e)
 
     # ------------------------------------------------------------------
     # 持续运行

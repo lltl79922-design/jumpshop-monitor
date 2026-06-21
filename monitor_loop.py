@@ -63,6 +63,9 @@ class JumpShopRunner(MonitorRunner):
             cfg["notifications"]["feishu"]["app_id"] = os.environ["FEISHU_APP_ID"]
         if os.environ.get("FEISHU_APP_SECRET"):
             cfg["notifications"]["feishu"]["app_secret"] = os.environ["FEISHU_APP_SECRET"]
+        if os.environ.get("DEEPSEEK_API_KEY"):
+            cfg.setdefault("deepseek", {})["api_key"] = os.environ["DEEPSEEK_API_KEY"]
+            cfg["deepseek"].setdefault("enabled", True)
         return cfg
 
     # ---- DB (Jump Shop 表结构) ----

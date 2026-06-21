@@ -74,6 +74,9 @@ class UfotableRunner(MonitorRunner):
             if os.environ.get(env_key):
                 nc = cfg.setdefault("notifications", {}).setdefault("feishu", {})
                 nc[cfg_key] = os.environ[env_key]
+        if os.environ.get("DEEPSEEK_API_KEY"):
+            cfg.setdefault("deepseek", {})["api_key"] = os.environ["DEEPSEEK_API_KEY"]
+            cfg["deepseek"].setdefault("enabled", True)
         return cfg
 
     # ---- DB ----
