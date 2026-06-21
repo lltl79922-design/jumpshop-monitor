@@ -9,6 +9,15 @@
             "image_preview": true
         }
     },
+    "deepseek": {
+        "enabled": true,
+        "api_key": "YOUR_DEEPSEEK_API_KEY",
+        "model": "deepseek-chat",
+        "summary_enabled": true,
+        "summary_min_changes": 3,
+        "max_tokens": 500,
+        "temperature": 0.7
+    },
     "monitor_options": {
         "detect_new_products": true,
         "detect_restocks": true,

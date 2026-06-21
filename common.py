@@ -1129,6 +1129,7 @@ class MonitorRunner:
             ds = cfg.setdefault("deepseek", {})
             ds["api_key"] = os.environ["DEEPSEEK_API_KEY"]
             ds.setdefault("enabled", True)
+            ds.setdefault("summary_enabled", True)
 
         return cfg
 

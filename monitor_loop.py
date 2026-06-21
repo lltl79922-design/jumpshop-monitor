@@ -66,6 +66,7 @@ class JumpShopRunner(MonitorRunner):
         if os.environ.get("DEEPSEEK_API_KEY"):
             cfg.setdefault("deepseek", {})["api_key"] = os.environ["DEEPSEEK_API_KEY"]
             cfg["deepseek"].setdefault("enabled", True)
+            cfg["deepseek"].setdefault("summary_enabled", True)
         return cfg
 
     # ---- DB (Jump Shop 表结构) ----
