@@ -4,8 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/ufotable-monitor.yml'
-  schedule:
-    - cron: '17 */6 * * *'
+  # schedule disabled — project terminated 2026-06-21
   workflow_dispatch:
 
 permissions:

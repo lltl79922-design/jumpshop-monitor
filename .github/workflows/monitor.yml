@@ -4,8 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/monitor.yml'
-  schedule:
-    - cron: '7 */6 * * *'
+  # schedule disabled — project terminated 2026-06-21
   workflow_dispatch:
 
 permissions:

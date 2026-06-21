@@ -7,10 +7,7 @@ on:
       - 'common.py'
       - 'config.example.json'
       - '.github/workflows/healthcheck.yml'
-  schedule:
-    - cron: '37 18 * * *'  # 北京时间 2:37
-    - cron: '37 20 * * *'  # 北京时间 4:37
-    - cron: '37 22 * * *'  # 北京时间 6:37
+  # schedule disabled — project terminated 2026-06-21
   workflow_dispatch:
 
 concurrency:

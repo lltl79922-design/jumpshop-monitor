@@ -1,8 +1,7 @@
 name: Self-Heal (自动修复)
 
 on:
-  schedule:
-    - cron: '13 */1 * * *'  # 每小时第13分钟
+  # schedule disabled — project terminated 2026-06-21
   workflow_dispatch:
 
 permissions:
