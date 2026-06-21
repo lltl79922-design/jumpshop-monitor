@@ -4,7 +4,8 @@ on:
   push:
     paths:
       - '.github/workflows/monitor.yml'
-  # schedule disabled — project terminated 2026-06-21
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时触发，job内自循环350分钟
   workflow_dispatch:
 
 permissions:

@@ -4,7 +4,8 @@ on:
   push:
     paths:
       - '.github/workflows/ufotable-monitor.yml'
-  # schedule disabled — project terminated 2026-06-21
+  schedule:
+    - cron: '30 */6 * * *'  # 每6小时触发(偏移30分)，job内自循环350分钟
   workflow_dispatch:
 
 permissions:

@@ -8,7 +8,8 @@ on:
       - 'common.py'
       - 'ufotable_config.example.json'
       - '.github/workflows/ufotable-healthcheck.yml'
-  # schedule disabled — project terminated 2026-06-21
+  schedule:
+    - cron: '30 */4 * * *'  # 每4小时自检(偏移30分)
   workflow_dispatch:
 
 concurrency:

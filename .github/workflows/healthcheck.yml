@@ -7,7 +7,8 @@ on:
       - 'common.py'
       - 'config.example.json'
       - '.github/workflows/healthcheck.yml'
-  # schedule disabled — project terminated 2026-06-21
+  schedule:
+    - cron: '0 */4 * * *'  # 每4小时自检
   workflow_dispatch:
 
 concurrency:

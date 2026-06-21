@@ -1,7 +1,8 @@
 name: Self-Heal (自动修复)
 
 on:
-  # schedule disabled — project terminated 2026-06-21
+  schedule:
+    - cron: '*/15 * * * *'  # 每15分钟死人开关检测，>90min未更新则自动重启monitor
   workflow_dispatch:
 
 permissions:
