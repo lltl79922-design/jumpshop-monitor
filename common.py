@@ -1197,8 +1197,19 @@ class MonitorRunner:
         if first_run:
             logging.info("First run with JSON state - building baseline...")
 
-        # 4. 产品数漂移日志 (仅警告, 不拦截)
+        # 4. 产品数骤降防御 (防止部分API响应导致状态损坏 → 断路器误报)
         old_total = old_state.get("total_products", 0)
+        if old_total > 200 and not first_run:
+            drop_ratio = len(products) / old_total
+            if drop_ratio < 0.85:
+                logging.error(
+                    "PRODUCT COUNT DROP: %d → %d (%.0f%%). "
+                    "Likely partial API fetch — skipping state update to prevent false new-product detection.",
+                    old_total, len(products), drop_ratio * 100
+                )
+                return 0
+
+        # 5. 产品数漂移日志 (仅警告, 不拦截)
         if old_total > 0 and not first_run:
             ratio = len(products) / old_total
             if ratio < 0.5 or ratio > 1.5:
@@ -1208,16 +1219,16 @@ class MonitorRunner:
                     old_total, len(products), ratio * 100
                 )
 
-        # 5. 变更检测 (new/restock/sold_out/price_change + soldout_delta)
+        # 6. 变更检测 (new/restock/sold_out/price_change + soldout_delta)
         changes, soldout_ids = detect_all_changes_from_state(
             old_state, products, now_str, cfg)
 
-        # 6. 闪电售罄检测
+        # 7. 闪电售罄检测
         lightning_threshold = cfg.get("monitor_options", {}).get(
             "lightning_sellout_threshold_seconds", 300)
         detect_lightning_from_state(old_state, changes, now_str, lightning_threshold)
 
-        # 7. 通知分发
+        # 8. 通知分发
         # old_total 优先使用 metadata, 但如果 metadata 为0而实际有历史数据, 用实际值
         # 防止 state corruption 导致 drift shield 盲区
         effective_old_total = old_total if old_total > 0 else len(old_state.get("products", {}))
@@ -1225,14 +1236,14 @@ class MonitorRunner:
             cfg, db_conn, changes, now_str, first_run, silent,
             old_total=effective_old_total)
 
-        # 8. 记录变更到 DB
+        # 9. 记录变更到 DB
         if changes and db_conn:
             try:
                 log_changes(db_conn, changes, now_str)
             except Exception as e:
                 logging.warning("Failed to log changes to DB: %s", e)
 
-        # 9. 构建并保存新状态
+        # 10. 构建并保存新状态
         new_products = build_new_state(products, old_state, now_str)
         new_state = {
             "version": 2,
@@ -1243,7 +1254,7 @@ class MonitorRunner:
         }
         save_json_state(new_state, state_file)
 
-        # 10. 同步 DB (可选, 供 analysis.py 使用)
+        # 11. 同步 DB (可选, 供 analysis.py 使用)
         if db_conn:
             try:
                 self.update_db(db_conn, products, now_str)
@@ -1314,8 +1325,12 @@ class MonitorRunner:
             return  # 完全静默，连断路器摘要都不发
 
         # --- 防御层 4: 断路器 ---
+        # v2.3: 动态阈值 — 随商店规模缩放，避免大型店铺频繁误报
+        # 显式配置值优先，否则取 max(150, 旧状态商品总数 × 12%)
         fuse_threshold = cfg.get("monitor_options", {}).get(
-            "new_product_fuse_threshold", 150)
+            "new_product_fuse_threshold", None)
+        if fuse_threshold is None:
+            fuse_threshold = max(150, int(old_total * 0.12))
         if new_count > fuse_threshold:
             logging.warning(
                 "CIRCUIT BREAKER: %d new products exceeds threshold %d",
