@@ -1234,7 +1234,7 @@ class MonitorRunner:
         effective_old_total = old_total if old_total > 0 else len(old_state.get("products", {}))
         self._dispatch_notifications(
             cfg, db_conn, changes, now_str, first_run, silent,
-            old_total=effective_old_total)
+            old_total=effective_old_total, old_state=old_state)
 
         # 9. 记录变更到 DB
         if changes and db_conn:
@@ -1275,15 +1275,17 @@ class MonitorRunner:
     # ------------------------------------------------------------------
 
     def _dispatch_notifications(self, cfg, conn, changes, now_str,
-                                 is_first_run, silent, old_total=0):
+                                 is_first_run, silent, old_total=0,
+                                 old_state=None):
         """统一的通知分发逻辑。
 
         防御层 (按优先级):
           1. 首次运行静默 (不轰炸基线)
           2. Silent 模式
-          3. **产品数漂移检测** — old_total 与新上新数对比, 防状态损坏
-          4. **断路器** — 上新 > 阈值 → 纯文本摘要
-          5. 正常通知 → 飞书卡片 + Bot 预警
+          3. **状态过期静默** — updated_at > 90min → 只保留上新，售罄/补货静默
+          4. **产品数漂移检测** — old_total 与新上新数对比, 防状态损坏
+          5. **断路器** — 上新 > 阈值 → 纯文本摘要
+          6. 正常通知 → 飞书卡片 + Bot 预警
         """
         if not changes:
             return
@@ -1313,7 +1315,38 @@ class MonitorRunner:
 
         new_count = sum(1 for c in changes if c["change_type"] == "new")
 
-        # --- 防御层 3: 产品数漂移检测 (NEW in v2.1) ---
+        # --- 防御层 3: 状态过期静默 (STALE STATE GUARD) ---
+        # 状态超过 90min 未更新 → 售罄/补货大概率是旧闻 → 静默同步
+        # 只允许 genuine 新商品通知通过（上新不太可能"补发"）
+        if old_state is not None:
+            stale_threshold = cfg.get("monitor_options", {}).get(
+                "stale_state_silence_minutes", 90)
+            old_updated = old_state.get("updated_at", "")
+            if old_updated and "JST" in old_updated:
+                try:
+                    old_dt = datetime.strptime(
+                        old_updated.replace(" JST", ""), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=JST)
+                    now_dt = datetime.now(JST)
+                    stale_min = int((now_dt - old_dt).total_seconds() / 60)
+                    if stale_min > stale_threshold:
+                        stale_new = sum(1 for c in changes if c["change_type"] == "new")
+                        stale_other = len(changes) - stale_new
+                        if stale_other > 0 and stale_new <= 5:
+                            logging.warning(
+                                "STALE STATE SILENCE: state %dmin old, "
+                                "suppressing %d non-new changes (%d new allowed). "
+                                "State will sync silently.",
+                                stale_min, stale_other, stale_new
+                            )
+                            # 只保留上新通知，售罄/补货/价格变动全部静默
+                            changes[:] = [c for c in changes if c["change_type"] == "new"]
+                            if not changes:
+                                return
+                except Exception:
+                    pass  # 时间解析失败不阻塞
+
+        # --- 防御层 4: 产品数漂移检测 (NEW in v2.1) ---
         # 如果上新数超过旧状态产品总数的 30%，极可能是状态损坏而非真实上新
         if old_total > 50 and new_count > old_total * 0.3:
             logging.error(
