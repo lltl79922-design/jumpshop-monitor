@@ -1202,12 +1202,30 @@ class MonitorRunner:
         if old_total > 200 and not first_run:
             drop_ratio = len(products) / old_total
             if drop_ratio < 0.85:
-                logging.error(
-                    "PRODUCT COUNT DROP: %d → %d (%.0f%%). "
-                    "Likely partial API fetch — skipping state update to prevent false new-product detection.",
-                    old_total, len(products), drop_ratio * 100
-                )
-                return 0
+                # 状态过期时放宽保护：过期数据比潜在误报更危险
+                stale_minutes = 9999
+                old_ts = old_state.get("updated_at", "")
+                if old_ts:
+                    try:
+                        ts_clean = old_ts.replace(" JST", "")
+                        old_dt = datetime.strptime(ts_clean, "%Y-%m-%d %H:%M:%S")
+                        old_dt = old_dt.replace(tzinfo=timezone(timedelta(hours=9)))
+                        stale_minutes = (datetime.now(timezone.utc) - old_dt).total_seconds() / 60
+                    except Exception:
+                        pass
+                if stale_minutes > 360:  # 超过6h未更新，接受新数据
+                    logging.warning(
+                        "PRODUCT COUNT DROP overridden: %d → %d (%.0f%%) — "
+                        "state is %.0fh stale, accepting new data to prevent drift.",
+                        old_total, len(products), drop_ratio * 100, stale_minutes / 60
+                    )
+                else:
+                    logging.error(
+                        "PRODUCT COUNT DROP: %d → %d (%.0f%%). "
+                        "Likely partial API fetch — skipping state update to prevent false new-product detection.",
+                        old_total, len(products), drop_ratio * 100
+                    )
+                    return 0
 
         # 5. 产品数漂移日志 (仅警告, 不拦截)
         if old_total > 0 and not first_run:
