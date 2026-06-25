@@ -1,0 +1,25 @@
+{
+  "products": [
+    {
+      "id": "18045905",
+      "label": "电锯人 电次 纪念收藏卡"
+    },
+    {
+      "id": "18042627",
+      "label": "ONE PIECE 招福亚克力卡"
+    },
+    {
+      "id": "18053413",
+      "label": "忧国莫里亚蒂 艺术杯垫全套"
+    }
+  ],
+  "config": {
+    "interval_seconds": 30,
+    "feishu_webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/d23baa3e-f64d-4194-b71c-818e964f7590",
+    "user_agents": [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+    ]
+  }
+}

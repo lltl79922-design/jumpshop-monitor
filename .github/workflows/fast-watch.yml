@@ -1,0 +1,125 @@
+name: Fast Watch (高频盯梢)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 每5分钟触发，job内自循环30s间隔
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fast-watch
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Fast watch self-loop
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          set +e
+          MAX_RUNTIME_SEC=270  # 4.5分钟（5分钟cron间隔内）
+          START_TIME=$(date +%s)
+          ITERATION=0
+          INTERVAL=30  # 每30秒查一轮
+
+          mkdir -p data
+
+          # Sync state from git
+          git fetch origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null || true
+
+          # Init state if needed
+          if [ ! -f data/fast_watch_state.json ]; then
+            echo '{}' > data/fast_watch_state.json
+          fi
+
+          # Init watchlist if needed (default: 3 products)
+          if [ ! -f data/fast_watchlist.json ]; then
+            cat > data/fast_watchlist.json << 'WATCHLIST'
+          {
+            "products": [
+              {"id": "18045905", "label": "电锯人 纪念收藏卡"},
+              {"id": "18042627", "label": "ONE PIECE 招福亚克力卡"},
+              {"id": "18053413", "label": "忧国莫里亚蒂 杯垫全套"}
+            ],
+            "config": {
+              "interval_seconds": 30,
+              "feishu_webhook_url": "",
+              "user_agents": ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"]
+            }
+          }
+          WATCHLIST
+          fi
+
+          # Inject Feishu webhook
+          python3 -c "
+          import json
+          with open('data/fast_watchlist.json','r') as f:
+              wl = json.load(f)
+          wl['config']['feishu_webhook_url'] = '${FEISHU_WEBHOOK_URL}'
+          with open('data/fast_watchlist.json','w') as f:
+              json.dump(wl, f, ensure_ascii=False, indent=2)
+          "
+
+          git config user.email "bot@fastwatch.monitor"
+          git config user.name "Fast Watch Bot"
+
+          push_state() {
+            cp data/fast_watch_state.json /tmp/fw_state_bak.json
+            for attempt in 1 2 3; do
+              git fetch origin main 2>/dev/null
+              git reset --hard origin/main 2>/dev/null
+              cp /tmp/fw_state_bak.json data/fast_watch_state.json
+              git add data/fast_watch_state.json
+              if git diff --staged --quiet; then
+                return 0
+              fi
+              git commit -m "bot(fastwatch): state update [skip ci]" 2>/dev/null || true
+              if git push origin main 2>&1; then
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
+          echo "=== Fast Watch self-loop started at $(date) ==="
+
+          while true; do
+            ITERATION=$((ITERATION + 1))
+            echo "--- Iteration $ITERATION at $(date) ---"
+
+            python3 fast_watch.py once 2>&1 || echo "Watch iteration failed (non-fatal)"
+
+            # Push state every 10 iterations
+            if [ $((ITERATION % 10)) -eq 0 ]; then
+              push_state
+            fi
+
+            # Check time limit
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_TIME))
+            if [ $ELAPSED -ge $MAX_RUNTIME_SEC ]; then
+              echo "Time limit reached (${ELAPSED}s)"
+              break
+            fi
+
+            sleep $INTERVAL
+          done
+
+          echo "=== Fast Watch self-loop ended: $ITERATION iterations at $(date) ==="
+          push_state
