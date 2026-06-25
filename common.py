@@ -1442,8 +1442,19 @@ class MonitorRunner:
             if ds_cfg.get("enabled") and ds_cfg.get("summary_enabled"):
                 try:
                     from ai_analysis import summarize_changes
+                    # Convert flat change list to dict format expected by summarize_changes
+                    changes_dict = {
+                        "new_products": [c["product"] for c in changes if c["change_type"] == "new"],
+                        "restocks": [c["product"] for c in changes if c["change_type"] == "restock"],
+                        "sold_out": [c["product"] for c in changes if c["change_type"] == "sold_out"],
+                        "price_changes": [
+                            {**c["product"], "old_price": c.get("old_value", "?"),
+                             "new_price": c.get("new_value", "?")}
+                            for c in changes if c["change_type"] == "price_change"
+                        ],
+                    }
                     summary = summarize_changes(
-                        changes, self.shop.name, deepseek_cfg=ds_cfg)
+                        changes_dict, self.shop.name, deepseek_cfg=ds_cfg)
                     if summary:
                         requests.post(
                             feishu_cfg["webhook_url"],
