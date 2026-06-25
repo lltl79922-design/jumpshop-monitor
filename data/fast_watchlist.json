@@ -2,24 +2,62 @@
   "products": [
     {
       "id": "18045905",
-      "label": "电锯人 电次 纪念收藏卡"
+      "label": "电锯人 电次 纪念收藏卡 32种 ¥550"
     },
     {
       "id": "18042627",
-      "label": "ONE PIECE 招福亚克力卡"
+      "label": "ONE PIECE 招福亚克力卡 10种 ¥880"
     },
     {
       "id": "18053413",
-      "label": "忧国莫里亚蒂 艺术杯垫全套"
+      "label": "忧国莫里亚蒂 杯垫全套 48种 ¥5940"
+    },
+    {
+      "id": "18067805",
+      "label": "电锯人 亚克力收藏 15种 ¥660"
+    },
+    {
+      "id": "18055999",
+      "label": "JAS 原创贴纸收藏 第1弹 30种 ¥660"
+    },
+    {
+      "id": "18043150",
+      "label": "咒术回战 杯垫 第2弹 45种 ¥660"
+    },
+    {
+      "id": "18042005",
+      "label": "电锯人 电次 收藏 15种 ¥660"
+    },
+    {
+      "id": "18056022",
+      "label": "ONE PIECE 收藏徽章 WINTER 20种 ¥550"
+    },
+    {
+      "id": "18051836",
+      "label": "HUNTER×HUNTER 金属卡片 第1弹 12种 ¥550"
+    },
+    {
+      "id": "18044094",
+      "label": "ONE PIECE 金属卡片收藏 15种 ¥660"
+    },
+    {
+      "id": "18056004",
+      "label": "NARUTO 杯垫 第3弹 45种 ¥660"
+    },
+    {
+      "id": "18036316",
+      "label": "ONE PIECE 扑克牌 ¥330"
+    },
+    {
+      "id": "18038589",
+      "label": "ONE PIECE 扑克牌 ¥330"
     }
   ],
   "config": {
     "interval_seconds": 30,
-    "feishu_webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/d23baa3e-f64d-4194-b71c-818e964f7590",
+    "feishu_webhook_url": "",
     "user_agents": [
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     ]
   }
 }
