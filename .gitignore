@@ -1,6 +1,7 @@
 # Jump Shop 监控 - 忽略文件
 data/products.db
 data/products.db-*
+jumpshop.db
 data/ufotable.db
 data/ufotable.db-*
 *.log
