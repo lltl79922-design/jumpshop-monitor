@@ -808,10 +808,10 @@ def validate_state_integrity(state, expected_min_products=50):
     reported_total = state.get("total_products", 0)
     soldout_ids = state.get("soldout_ids", [])
 
-    # 1. total_products 一致性: 偏差 >15% 标记异常
+    # 1. total_products 一致性: 偏差 >5% 标记异常 (v2.4: 从15%收紧至5%)
     if reported_total > 0 and actual_total > 0:
         drift_pct = abs(actual_total - reported_total) / max(reported_total, 1)
-        if drift_pct > 0.15:
+        if drift_pct > 0.05:
             return False, True, (
                 f"total_products mismatch: reported={reported_total}, actual={actual_total}"
             )
@@ -830,6 +830,12 @@ def validate_state_integrity(state, expected_min_products=50):
             return False, False, (
                 f"Too many orphan soldout_ids: {len(orphan_soldout)}/{len(soldout_ids)}"
             )
+
+    # 4. updated_at 存在性检查: products 有数据但无时间戳 → 异常恢复产物
+    if actual_total > expected_min_products and not state.get("updated_at", "").strip():
+        return False, True, (
+            f"Missing updated_at with {actual_total} products — likely recovery artifact"
+        )
 
     return True, False, "OK"
 
@@ -1301,9 +1307,8 @@ class MonitorRunner:
           1. 首次运行静默 (不轰炸基线)
           2. Silent 模式
           3. **状态过期静默** — updated_at > 90min → 只保留上新，售罄/补货静默
-          4. **产品数漂移检测** — old_total 与新上新数对比, 防状态损坏
-          5. **断路器** — 上新 > 阈值 → 纯文本摘要
-          6. 正常通知 → 飞书卡片 + Bot 预警
+          4. **BURST SHIELD** — 上新 > max(50, old_total×8%) → 完全静默 (v2.4)
+          5. 正常通知 → 飞书卡片 + Bot 预警
         """
         if not changes:
             return
@@ -1364,45 +1369,24 @@ class MonitorRunner:
                 except Exception:
                     pass  # 时间解析失败不阻塞
 
-        # --- 防御层 4: 产品数漂移检测 (NEW in v2.1) ---
-        # 如果上新数超过旧状态产品总数的 30%，极可能是状态损坏而非真实上新
-        if old_total > 50 and new_count > old_total * 0.3:
-            logging.error(
-                "DRIFT SHIELD: %d new out of %d old total (%.0f%%). "
-                "Suppressing ALL notifications — likely state corruption.",
-                new_count, old_total,
-                new_count / max(old_total, 1) * 100
-            )
-            return  # 完全静默，连断路器摘要都不发
-
-        # --- 防御层 4: 断路器 ---
-        # v2.3: 动态阈值 — 随商店规模缩放，避免大型店铺频繁误报
-        # 显式配置值优先，否则取 max(150, 旧状态商品总数 × 12%)
-        fuse_threshold = cfg.get("monitor_options", {}).get(
+        # --- 防御层 4: BURST SHIELD (v2.4) ---
+        # 上新数超过 max(50, old_total × 8%) → 极可能为状态损坏或版本回滚
+        # 统一取代旧 DRIFT SHIELD (30%) + CIRCUIT BREAKER (12%+飞书文本通知)
+        # 完全静默 — 不发送任何飞书通知，仅记录日志
+        burst_threshold = cfg.get("monitor_options", {}).get(
             "new_product_fuse_threshold", None)
-        if fuse_threshold is None:
-            fuse_threshold = max(150, int(old_total * 0.12))
-        if new_count > fuse_threshold:
-            logging.warning(
-                "CIRCUIT BREAKER: %d new products exceeds threshold %d",
-                new_count, fuse_threshold)
-            # 降级为纯文本摘要
-            summary_text = (
-                f"{self.shop.name} 異常検知\n\n"
-                f"新商品数 {new_count} 件が闘値 {fuse_threshold} を超えました。\n"
-                f"キャッシュ破損の可能性あり。データは正常に更新済みです。\n"
-                f"他: 補貨 {sum(1 for c in changes if c['change_type']=='restock')} / "
-                f"售罄 {sum(1 for c in changes if c['change_type']=='sold_out')} / "
-                f"価格変更 {sum(1 for c in changes if c['change_type']=='price_change')}\n\n"
-                f"{now_str} | {self.shop.footer}"
+        if burst_threshold is None:
+            burst_threshold = max(50, int(old_total * 0.08))
+        if old_total > 50 and new_count > burst_threshold:
+            logging.error(
+                "BURST SHIELD: %d new products exceeds threshold %d "
+                "(%.0f%% of %d old total). "
+                "Suppressing ALL notifications — likely state corruption or rollback. "
+                "State will be updated silently.",
+                new_count, burst_threshold,
+                new_count / max(old_total, 1) * 100, old_total
             )
-            feishu_cfg = cfg.get("notifications", {}).get("feishu", {})
-            if feishu_cfg.get("enabled") and feishu_cfg.get("webhook_url"):
-                send_feishu_card(
-                    feishu_cfg["webhook_url"],
-                    {"msg_type": "text", "content": {"text": summary_text}},
-                )
-            return
+            return  # 完全静默，不发送飞书
 
         # --- 正常通知 ---
         self._send_all_notifications(cfg, conn, changes, now_str)
