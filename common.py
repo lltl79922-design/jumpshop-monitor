@@ -389,6 +389,19 @@ def build_feishu_cards(changes, now_str, shop_config, max_per_card=50, max_cards
       - footer: 页脚文字
       - subtitle_field: 商品副标题字段 ("vendor" 或 "works")
     """
+    # ---- 去重: 防止同一商品同一变更类型重复出现 (product_id + change_type) ----
+    seen = set()
+    deduped = []
+    for c in changes:
+        key = (c["product_id"], c["change_type"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    if len(deduped) < len(changes):
+        logging.warning(
+            "build_feishu_cards: dedup removed %d duplicate change entries",
+            len(changes) - len(deduped))
+    changes = deduped
     total = len(changes)
     if total == 0:
         return []
@@ -1256,27 +1269,29 @@ class MonitorRunner:
         # old_total 优先使用 metadata, 但如果 metadata 为0而实际有历史数据, 用实际值
         # 防止 state corruption 导致 drift shield 盲区
         effective_old_total = old_total if old_total > 0 else len(old_state.get("products", {}))
-        self._dispatch_notifications(
-            cfg, db_conn, changes, now_str, first_run, silent,
-            old_total=effective_old_total, old_state=old_state)
+        try:
+            self._dispatch_notifications(
+                cfg, db_conn, changes, now_str, first_run, silent,
+                old_total=effective_old_total, old_state=old_state)
 
-        # 9. 记录变更到 DB
-        if changes and db_conn:
-            try:
-                log_changes(db_conn, changes, now_str)
-            except Exception as e:
-                logging.warning("Failed to log changes to DB: %s", e)
-
-        # 10. 构建并保存新状态
-        new_products = build_new_state(products, old_state, now_str)
-        new_state = {
-            "version": 2,
-            "updated_at": now_str,
-            "total_products": len(products),
-            "soldout_ids": soldout_ids,
-            "products": new_products,
-        }
-        save_json_state(new_state, state_file)
+            # 9. 记录变更到 DB
+            if changes and db_conn:
+                try:
+                    log_changes(db_conn, changes, now_str)
+                except Exception as e:
+                    logging.warning("Failed to log changes to DB: %s", e)
+        finally:
+            # 10. 构建并保存新状态 — finally 确保即使通知发送崩溃也一定保存状态
+            # 这是防止"重复播报"的关键：状态不保存 → 下次运行从旧状态重新检测 → 同样变更再次播报
+            new_products = build_new_state(products, old_state, now_str)
+            new_state = {
+                "version": 2,
+                "updated_at": now_str,
+                "total_products": len(products),
+                "soldout_ids": soldout_ids,
+                "products": new_products,
+            }
+            save_json_state(new_state, state_file)
 
         # 11. 同步 DB (可选, 供 analysis.py 使用)
         if db_conn:
@@ -1337,6 +1352,35 @@ class MonitorRunner:
             return
 
         new_count = sum(1 for c in changes if c["change_type"] == "new")
+
+        # --- 防御层 2.5: 极端过期完全静默 (HARD STALE CAP) ---
+        # 状态超过 24h 未更新 → 极可能为长期故障恢复/状态损坏
+        # 此时大量"变更"实为历史累积 → 完全静默更新，不发任何通知
+        # 防止用户收到 100+ 条重复飞书卡片轰炸（本次修复的核心原因）
+        if old_state is not None:
+            hard_stale_hours = cfg.get("monitor_options", {}).get(
+                "hard_stale_silence_hours", 24)
+            old_updated = old_state.get("updated_at", "")
+            if old_updated and "JST" in old_updated:
+                try:
+                    old_dt = datetime.strptime(
+                        old_updated.replace(" JST", ""), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=JST)
+                    now_dt = datetime.now(JST)
+                    stale_h = int((now_dt - old_dt).total_seconds() / 3600)
+                    if stale_h > hard_stale_hours:
+                        logging.error(
+                            "HARD STALE CAP: state is %dh old (>%dh threshold). "
+                            "Suppressing ALL notifications — state will sync silently. "
+                            "Changes: %d total (new=%d, restock=%d, sold_out=%d, price=%d).",
+                            stale_h, hard_stale_hours, len(changes), new_count,
+                            sum(1 for c in changes if c["change_type"] == "restock"),
+                            sum(1 for c in changes if c["change_type"] == "sold_out"),
+                            sum(1 for c in changes if c["change_type"] == "price_change")
+                        )
+                        return  # 完全静默，不发送飞书/企微/邮件
+                except Exception:
+                    pass  # 时间解析失败不阻塞
 
         # --- 防御层 3: 状态过期静默 (STALE STATE GUARD) ---
         # 状态超过 90min 未更新 → 售罄/补货大概率是旧闻 → 静默同步
