@@ -23,6 +23,16 @@ STATE_FILE = DATA_DIR / "fast_watch_state.json"
 LOG_FILE = SCRIPT_DIR / "logs" / "fast_watch.log"
 
 # ---------------------------------------------------------------------------
+# 通知冷却配置 — 防止同一商品同一变更类型短时间内重复通知
+# 即使 push_state 失败导致 git 状态回滚，冷却期也能拦截重复
+# ---------------------------------------------------------------------------
+NOTIFY_COOLDOWN = {
+    "restock": 900,       # 15分钟
+    "sold_out": 1800,     # 30分钟
+    "new": 900,           # 15分钟
+    "price_change": 3600, # 60分钟
+}
+
 def setup_logging():
     Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -93,8 +103,41 @@ def check_product(product_id, user_agents):
         return {"id": product_id, "status": "error", "title": str(e), "price": None}
 
 # ---------------------------------------------------------------------------
-def send_feishu_alert(webhook_url, product_info, change_type):
-    """飞书即时告警"""
+def _check_cooldown(state, product_id, change_type):
+    """检查通知冷却期。返回 True 表示在冷却中应跳过。"""
+    notified = state.get("_notified", {})
+    key = f"{product_id}:{change_type}"
+    last_str = notified.get(key, "")
+    if not last_str:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(last_str)
+        cooldown = NOTIFY_COOLDOWN.get(change_type, 900)
+        elapsed = (datetime.now(JST) - last_dt).total_seconds()
+        if elapsed < cooldown:
+            logging.info(
+                "[COOLDOWN] %s:%s — last notified %.0fs ago (< %ds), skipping",
+                product_id, change_type, elapsed, cooldown)
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
+def _mark_notified(state, product_id, change_type):
+    """记录通知时间戳到状态"""
+    if "_notified" not in state:
+        state["_notified"] = {}
+    key = f"{product_id}:{change_type}"
+    state["_notified"][key] = datetime.now(JST).isoformat()
+
+
+def send_feishu_alert(webhook_url, product_info, change_type, state=None):
+    """飞书即时告警（带冷却检查）"""
+    pid = str(product_info.get("id", ""))
+    if state and _check_cooldown(state, pid, change_type):
+        return False
+
     now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
     emoji = {"restock": "🟢", "sold_out": "🔴", "new": "🆕", "price_change": "💰"}
 
@@ -119,10 +162,14 @@ def send_feishu_alert(webhook_url, product_info, change_type):
         resp = requests.post(webhook_url, json=payload, timeout=10)
         if resp.json().get("code") == 0:
             logging.info(f"Feishu alert sent: {change_type} - {product_info['title']}")
+            if state:
+                _mark_notified(state, pid, change_type)
+            return True
         else:
             logging.error(f"Feishu error: {resp.json()}")
     except Exception as e:
         logging.error(f"Feishu send failed: {e}")
+    return False
 
 # ---------------------------------------------------------------------------
 def main_loop():
@@ -145,7 +192,7 @@ def main_loop():
 
     while True:
         try:
-            new_state = {}
+            new_state = {"_notified": state.get("_notified", {})}
             for item in wl["products"]:
                 pid = str(item["id"])
                 product = check_product(pid, user_agents)
@@ -170,24 +217,24 @@ def main_loop():
                 elif old_status == "sold_out" and new_status == "available":
                     logging.info(f"[RESTOCK] {pid} {product.get('title','?')}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "restock")
+                        send_feishu_alert(feishu_url, product, "restock", state=new_state)
                 elif old_status == "available" and new_status == "sold_out":
                     logging.info(f"[SOLD_OUT] {pid} {product.get('title','?')}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "sold_out")
+                        send_feishu_alert(feishu_url, product, "sold_out", state=new_state)
                 elif old_status == "not_found" and new_status != "not_found":
                     logging.info(f"[NEW] {pid} {product.get('title','?')} just appeared!")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "new")
+                        send_feishu_alert(feishu_url, product, "new", state=new_state)
                 elif old.get("price") and product.get("price") and old["price"] != product["price"]:
                     logging.info(f"[PRICE] {pid} {old['price']} -> {product['price']}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "price_change")
+                        send_feishu_alert(feishu_url, product, "price_change", state=new_state)
 
                 # 请求间隔（针对单个商品）
                 time.sleep(random.uniform(0.5, 1.5))
 
-            # 保存最新状态
+            # 保存最新状态（含通知冷却记录）
             state = new_state
             save_state(state)
 
@@ -258,7 +305,9 @@ if __name__ == "__main__":
             ua = wl["config"].get("user_agents", [])
             feishu_url = wl["config"].get("feishu_webhook_url", "")
             state = load_state()
-            new_state = {}
+            new_state = {"_notified": state.get("_notified", {})}
+            alerts_sent = 0
+            alerts_skipped = 0
 
             for item in wl["products"]:
                 pid = str(item["id"])
@@ -281,24 +330,37 @@ if __name__ == "__main__":
                 elif old_status == "sold_out" and new_status == "available":
                     logging.info(f"[RESTOCK!] {pid} {product.get('title','?')}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "restock")
+                        if send_feishu_alert(feishu_url, product, "restock", state=new_state):
+                            alerts_sent += 1
+                        else:
+                            alerts_skipped += 1
                 elif old_status == "available" and new_status == "sold_out":
                     logging.info(f"[SOLD_OUT] {pid} {product.get('title','?')}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "sold_out")
+                        if send_feishu_alert(feishu_url, product, "sold_out", state=new_state):
+                            alerts_sent += 1
+                        else:
+                            alerts_skipped += 1
                 elif old_status == "not_found" and new_status != "not_found":
                     logging.info(f"[NEW!] {pid} just appeared: {product.get('title','?')}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "new")
+                        if send_feishu_alert(feishu_url, product, "new", state=new_state):
+                            alerts_sent += 1
+                        else:
+                            alerts_skipped += 1
                 elif old.get("price") and product.get("price") and old["price"] != product["price"]:
                     logging.info(f"[PRICE] {pid} {old['price']} -> {product['price']}")
                     if feishu_url:
-                        send_feishu_alert(feishu_url, product, "price_change")
+                        if send_feishu_alert(feishu_url, product, "price_change", state=new_state):
+                            alerts_sent += 1
+                        else:
+                            alerts_skipped += 1
 
                 time.sleep(random.uniform(0.5, 1.5))
 
             save_state(new_state)
-            logging.info(f"Watch once complete. {len(wl['products'])} products checked.")
+            logging.info(f"Watch once complete. {len(wl['products'])} products checked, "
+                         f"{alerts_sent} alerts sent, {alerts_skipped} cooldown-skipped.")
 
         elif cmd == "run":
             # python fast_watch.py run  —  持续运行

@@ -80,20 +80,29 @@ jobs:
 
           push_state() {
             cp data/fast_watch_state.json /tmp/fw_state_bak.json
-            for attempt in 1 2 3; do
+            for attempt in 1 2 3 4 5; do
               git fetch origin main 2>/dev/null
               git reset --hard origin/main 2>/dev/null
               cp /tmp/fw_state_bak.json data/fast_watch_state.json
               git add data/fast_watch_state.json
               if git diff --staged --quiet; then
+                echo "  [push_state] no changes vs remote"
+                rm -f /tmp/fw_state_bak.json
                 return 0
               fi
               git commit -m "bot(fastwatch): state update [skip ci]" 2>/dev/null || true
               if git push origin main 2>&1; then
+                echo "  [push_state] OK (attempt $attempt)"
+                rm -f /tmp/fw_state_bak.json
                 return 0
               fi
-              sleep 3
+              echo "  [push_state] attempt $attempt/5 failed, retrying in $((attempt * 2))s..."
+              sleep $((attempt * 2))
             done
+            # FAILED: restore local state so next iteration doesn't see stale state
+            echo "  [push_state] FAILED after 5 attempts — restoring local state"
+            cp /tmp/fw_state_bak.json data/fast_watch_state.json
+            rm -f /tmp/fw_state_bak.json
             return 1
           }
 
