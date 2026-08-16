@@ -12,6 +12,7 @@ __pycache__/
 test_*.py
 config.json
 ufotable_config.json
+setup_local_tasks.ps1
 
 # 状态快照 (旧格式)
 data/state_snapshot.json
